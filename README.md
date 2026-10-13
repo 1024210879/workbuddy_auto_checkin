@@ -1,91 +1,205 @@
-# Buddy 加油站每日自动化（GitHub Actions）
+# Buddy 加油站每日自动化
 
-每天一次自动完成 **签到** 与 **派猫猫旅行**，结果推送到飞书。云端 runner 执行，不依赖任何常开设备。
+让电脑每天替你做两件小事：**签到领积分**、**送猫猫出门旅行并领回礼物**。做完把结果发到你的飞书。
 
-## 为什么需要刷新脚本
+每天上午 8:10 自动执行一次，全程约十几秒。除了第一次设置，之后你的电脑关着也没关系。
 
-云端 runner 没有你的本机登录态，也无法解密 Electron `safeStorage` 保护的凭据——所以 token **不能**在云端现取。做法是：
+---
 
-1. 在你自己的电脑上运行 `refresh_token.py`：读本机登录态 → 调本机客户端运行时解密 → 导出 token；
-2. 把它写进仓库 Secret `WB_ACCESS_TOKEN`；
-3. Actions 只从 Secret 读取。
+## 你会收到什么
 
-明文 token 不进仓库、不进日志、不落临时文件。
-
-## 一次性配置
-
-### 1. 建仓库并加入这两个文件
+每天一条飞书消息，签到和猫猫的情况分开写清楚。实际长这样：
 
 ```
-wb_auto.py
-refresh_token.py
-.github/workflows/daily.yml
+[绿色标题] Buddy 加油站 · 成功
+
+每日自动化
+
+签到
+✅ 今日已签过（今日 +100，连续 9 天，累计 900 积分）
+
+猫猫旅行
+🐱 领旅行礼物 +8 积分；今日旅行名额已用完，不再派出
 ```
 
-### 2. 配置 Secret
+顶部标题在签到成功时是「成功」并显示为绿色，签到没做成则是「部分失败」并显示为红色。猫猫那边即使出了问题，也只会写它自己的情况，不会连累签到的结论。
 
-```bash
-# 有 gh CLI 时，token 经 stdin 直接写入，不经过命令行明文
-python refresh_token.py --gh-repo OWNER/REPO
+---
 
-# 飞书机器人 webhook
-gh secret set FEISHU_WEBHOOK --repo OWNER/REPO --body "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx"
-```
+## 它能帮你做什么
 
-**没有 gh CLI**：脚本会自动降级为打印 token 并给出指引，不会报错退出。此时手动添加：
-
-1. `python refresh_token.py --gh-repo OWNER/REPO` 复制输出的 token（位于 `----- 以下为 token -----` 之间）
-2. 打开 `https://github.com/OWNER/REPO/settings/secrets/actions/new`
-3. Name 填 `WB_ACCESS_TOKEN`，Secret 粘贴 token，保存
-
-`OWNER/REPO` 可带 `.git` 或结尾 `/`，脚本会归一化；完整 URL 形式不受支持，请只传 `OWNER/REPO`。
-
-### 3. 手动触发一次验证
-
-Actions 页签 → 该 workflow → **Run workflow**。
-
-## 本机刷新 token 的时机
-
-token 由客户端签发、有效期约 28 天。出现「认证被拒」时，在本机重跑一次 `refresh_token.py` 即可。
-
-## 行为约定
-
-| 场景 | 行为 |
+| 情况 | 它会怎么做 |
 | --- | --- |
-| 今天未签到 | 调领取接口领积分 |
-| 今天已签到 | 读状态接口直接汇报，不再重复领取（幂等） |
-| 猫猫已到家 | 先领这趟的旅行积分 |
-| 猫猫在途中 | 只汇报位置与预计到家时间，不派出新的 |
-| 猫猫空闲且今日名额未用完 | 派一趟新的 |
-| 今日名额已用完 | 不再派出（读 `daily_limit_reached`，不硬撞接口） |
-| 猫猫失败 | 不影响签到结论，猫猫状态单独汇报 |
-| 整体成败 | **只看签到**：签到成功即成功 |
+| 今天还没签到 | 帮你领掉 |
+| 今天已经签过了 | 不重复领，直接告诉你现状 |
+| 猫猫已经旅行回来 | 先把这趟的礼物领了 |
+| 猫猫还在路上 | 只告诉你它在哪、大概几点回，不再派新的 |
+| 猫猫闲着、今天还有名额 | 派它出门一趟 |
+| 今天名额已经用完 | 不再派，避免白跑 |
+| 猫猫那边出问题 | 不影响签到，单独在消息里说明 |
 
-## 接口（以实际请求为准，从客户端 `app.asar` 中核对）
+---
+
+## 开始之前，你需要准备
+
+1. 一个 GitHub 账号（免费的就够）
+2. 电脑上装着 WorkBuddy 并且已经登录（只用来导出一次「通行证」，之后就不用了）
+3. 一个飞书群机器人（下面会教怎么拿地址）
+4. 电脑上有 Python（Win10/Win11 一般没有，装一次即可，官网下载时勾选 Add to PATH）
+
+> 整个过程只需要在你自己的电脑上做一次。之后每天由 GitHub 的服务器自动跑，你的电脑关着也没关系。
+
+---
+
+## 第一步：把代码放到 GitHub
+
+1. 打开 <https://github.com/new>
+2. 仓库名随意，例如 `workbuddy_auto`
+3. 可见性选 **Private**（私有）—— 虽然代码里没有任何密钥，但私有更稳妥
+4. 其他保持默认，点创建
+
+然后把本项目里的 4 个文件上传上去：`wb_auto.py`、`refresh_token.py`、`README.md`，以及 `.github` 文件夹（里面是 `daily.yml`）。
+
+上传方式：在仓库页面点 **Add file → Upload files**，把这几个文件拖进去，点提交。
+
+> `.github` 这一层必须保留原样，它是决定「每天什么时候跑」的地方。
+
+---
+
+## 第二步：配置两个「通行证」
+
+GitHub 不允许把密码、密钥直接写在代码里，所以要用它提供的「Secrets」功能存放。需要配两个。
+
+### 通行证一：你的登录身份（WB_ACCESS_TOKEN）
+
+因为 GitHub 的服务器不在你电脑上，它没法读你的登录状态，所以需要你先把「通行证」导出来交给它。
+
+在你电脑上打开命令行，进入本项目文件夹，运行：
+
+```
+python refresh_token.py --gh-repo 你的用户名/仓库名
+```
+
+比如仓库叫 `workbuddy_auto`、用户名是 `FXmonkey`，就写：
+
+```
+python refresh_token.py --gh-repo FXmonkey/workbuddy_auto
+```
+
+**如果屏幕上直接打印出了一长串字符**（在 `----- 以下为 token -----` 和 `----- 以上为 token -----` 之间），说明你的电脑没装 GitHub 的命令行工具，需要手动粘贴一次：
+
+1. 选中那一段字符，复制
+2. 浏览器打开 `https://github.com/你的用户名/仓库名/settings/secrets/actions/new`
+3. **Name** 一栏填 `WB_ACCESS_TOKEN`
+4. **Secret** 一栏粘贴刚才复制的内容
+5. 点 **Add secret**
+
+**如果屏幕显示「已写入 GitHub Secret」**，说明自动配好了，这一步直接跳过。
+
+### 通行证二：飞书机器人地址（FEISHU_WEBHOOK）
+
+1. 在飞书里建一个只有你自己的群（或任意群）
+2. 群设置 → 群机器人 → 添加机器人 → 自定义机器人
+3. 复制它给你的地址，形如 `https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx`
+4. 同样打开 `https://github.com/你的用户名/仓库名/settings/secrets/actions/new`
+5. **Name** 填 `FEISHU_WEBHOOK`，**Secret** 粘贴那个地址，点 **Add secret**
+
+配好后， Secrets 页面应该能看到两条记录。
+
+---
+
+## 第三步：试跑一次
+
+1. 打开你的仓库页面，点上方 **Actions** 页签
+2. 左侧选 **Buddy 加油站每日自动化**
+3. 右侧点 **Run workflow** 下拉，再点绿色的 **Run workflow**
+4. 等十几秒，刷新页面，点进刚才那次运行记录查看
+5. 页面右侧（或底部）有一份「Buddy 加油站每日自动化」汇总表，签到和猫猫各一行结论；同时飞书应该也收到了消息
+
+> 这一步即使全程显示绿色，也不代表一定成功——流程被刻意设计成「猫猫出问题不算整体失败」。所以**以飞书消息和汇总表里的文字为准**。如果是红的，先看下面的「收不到消息怎么办」。
+
+---
+
+## 之后每天会发生什么
+
+- 每天上午 **8:10** 自动执行一次
+- 你不用开电脑、不用管它
+- 消息会发到你配好的那个飞书群
+
+---
+
+## 大约每个月要做一次的事
+
+那个「通行证」有保质期，大约 **28 天**。过期后当天的飞书消息会提示「认证被拒」。
+
+到期时，在你电脑上重新跑一次第一步里那条命令即可，新的会自动覆盖旧的：
+
+```
+python refresh_token.py --gh-repo 你的用户名/仓库名
+```
+
+（如果它又是打印一长串字符，就照第二步的方法重新粘贴一次。）
+
+---
+
+## 收不到消息怎么办
+
+**飞书没收到任何消息**
+
+先确认 Secrets 里那两条都在（少一条都发不出来）。然后去 Actions → 最近一次运行 → 点「执行签到与派猫猫」这一步展开日志，拉到最下面会有一行 `[飞书]` 开头的内容，它会告诉你原因。最常见的是 `FEISHU_WEBHOOK` 地址复制得不完整。
+
+**Actions 页面是空的，或者看不到这个任务**
+
+说明 `.github/workflows/daily.yml` 没上传成功。检查仓库里是否真的有 `.github` 这个文件夹（注意开头有个点），并且里面躺着 `daily.yml`。
+
+**日志里提示「认证被拒」**
+
+通行证过期了，按上面「大约每个月要做一次的事」重新生成一次。
+
+**飞书里猫猫那行说失败了，但签到成功了**
+
+这是正常设计。签到是主线，只要签到成功就算这次任务成功；猫猫的问题只在它自己那一行说明，不影响签到结论，第二天会再试。
+
+**运行显示红色叉叉**
+
+说明脚本没能正常跑起来，点开日志看是哪一步红的。最常见的是电脑上没装 Python（见下一条）。
+
+**一切都是绿的，但飞书里说「认证被拒」**
+
+通行证过期了，按上面「大约每个月要做一次的事」重新生成一次。
+
+**一切都是绿的，但飞书里说签到没成功**
+
+同上，基本都是通行证的问题。重新生成一次再手动 Run workflow 试。
+
+**运行结果是「未找到可用的 Python 解释器」**
+
+电脑上没装 Python，去 <https://www.python.org/downloads/> 下载，安装时记得勾选 **Add Python to PATH**，然后重跑一次。
+
+---
+
+## 关于安全
+
+- 代码里**不包含**任何密钥、密码、你的登录信息
+- 你的「通行证」只存放在 GitHub 的 Secrets 里，GitHub 不会在日志中显示它，代码中也读不到明文
+- 日志里所有接口返回都做了脱敏，长串字符只保留开头几位
+- 脚本只做两件事：领签到积分、派猫猫旅行。不读你的文件，不改你的设置
+- 仓库建议保持 Private
+
+---
+
+## 附：给想了解细节的人
+
+实际请求的接口（均从 WorkBuddy 客户端中核对，非网上流传版本）：
 
 ```text
-POST {endpoint}/v2/billing/meter/checkin-activity-status   查今日签到状态
-POST {endpoint}/v2/billing/meter/daily-checkin            领取签到积分
+POST https://copilot.tencent.com/v2/billing/meter/checkin-activity-status   查今日签到状态
+POST https://copilot.tencent.com/v2/billing/meter/daily-checkin            领取签到积分
 
-GET  {endpoint}/v2/activity/growth/buddy/travel/status    查猫猫旅行状态
-POST {endpoint}/v2/activity/growth/buddy/travel/claim     领已到家的旅行积分
-GET  {endpoint}/v2/activity/growth/buddy/travel/config    取可派目的地
-POST {endpoint}/v2/activity/growth/buddy/travel/depart    派出新一趟
+GET  https://copilot.tencent.com/v2/activity/growth/buddy/travel/status    查猫猫旅行状态
+POST https://copilot.tencent.com/v2/activity/growth/buddy/travel/claim     领已到家的旅行积分
+GET  https://copilot.tencent.com/v2/activity/growth/buddy/travel/config    取可派目的地
+POST https://copilot.tencent.com/v2/activity/growth/buddy/travel/depart    派出新一趟
 ```
 
-`endpoint` 默认 `https://copilot.tencent.com`，可用 Secret/变量 `WB_ENDPOINT` 覆盖。
-
 所有返回统一是 `{code, msg, data}` 信封，业务字段在 `data` 里，脚本用 `unwrap()` 统一解包。
-
-## 安全说明
-
-- `refresh_token.py` 里的解密助手只含固定代码；加密信封通过 stdin 传入；解密密钥仅存在于客户端子进程内存，用后清零；
-- 明文 token 只出现在子进程返回值与最终写入目标，命令行、argv、环境变量、日志均不含明文；
-- `wb_auto.py` 打印的所有返回体都过 `masked()` 脱敏，长字符串只留首尾若干字符；
-- 写操作只在网络异常时有限重试，靠服务端幂等避免重复提交。
-
-## 常见问题
-
-**飞书没收到卡片** — 检查 `FEISHU_WEBHOOK` 是否配置；脚本会在日志里打印飞书返回的 `code`。
-
-**job 红了但飞书显示签到成功** — 这是刻意的：只有签到未达成才整体判失败，猫猫问题只体现为 warning 与卡片里的猫猫行。
