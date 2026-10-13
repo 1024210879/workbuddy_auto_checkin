@@ -228,7 +228,8 @@ def run_buddy(headers, endpoint):
         if not (200 <= scode < 300):
             return {"result": "ERROR", "report": "旅行状态接口异常（HTTP %s）" % scode, "notes": notes}
 
-        travel = dig(unwrap(sbody), "state")
+        raw_state = dig(unwrap(sbody), "state")
+        travel = raw_state
         daily_limit = bool(dig(unwrap(sbody), "daily_limit_reached"))
         travel_body = unwrap(sbody)
 
@@ -282,7 +283,10 @@ def run_buddy(headers, endpoint):
             return {"result": "ERROR",
                     "report": "派出失败：%s（HTTP %s）" % (msg or "未知", dcode), "notes": notes}
 
-        return {"result": "IDLE", "report": "；".join(notes) if notes else "猫猫当前空闲但状态未明"}
+        # 兜底：state 不是已知取值。原样汇报、不做写操作，避免误派或误领。
+        return {"result": "UNKNOWN_STATE",
+                "report": "；".join(notes) if notes else "未识别的旅行状态：%s" % raw_state,
+                "notes": notes}
     except Exception as e:
         return {"result": "ERROR", "report": "猫猫模块异常（%s: %s）" % (type(e).__name__, e), "notes": notes}
 
