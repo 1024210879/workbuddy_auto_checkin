@@ -3,11 +3,12 @@
 """refresh_token.py —— 在你自己的电脑上运行，把 WorkBuddy 登录态导出成 GitHub Secret。
 
 云端 runner 没有本机登录态，也无法解密 Electron safeStorage 保护的凭据；
-因此 token 必须由本机脚本导出，再手动写入仓库 Secret（绝不进仓库、绝不进日志）。
+因此 token 必须由本机脚本导出，再写入仓库 Secret（绝不进仓库、绝不进日志）。
 
 用法：
-    python refresh_token.py                 # 打印 token（你自己复制）
-    python refresh_token.py --gh-repo OWNER/REPO   # 直接写入 GitHub Secret（需 gh CLI 已登录）
+    python refresh_token.py                       # 只打印 token
+    python refresh_token.py --gh-repo OWNER/REPO  # 有 gh CLI 时直接写入 Secret
+                                                       没有 gh 则打印 token + 手动配置指引
 
 安全约定：
   - 明文 token 只出现在本进程内存与最终那一次目标位置；
@@ -19,6 +20,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -247,11 +249,21 @@ def load_session(path):
         return json.load(f)
 
 
+def normalize_repo(value):
+    """接受 OWNER/REPO 或 .git 后缀形式，统一成 OWNER/REPO 供 gh 与 URL 使用。"""
+    repo = value.strip().rstrip("/")
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    if repo.count("/") != 1 or not all(repo.split("/")):
+        raise SystemExit("仓库格式应为 OWNER/REPO（例如 FXmonkey/workbuddy_auto），收到：%s" % value)
+    return repo
+
+
 def main():
     gh_repo = None
     args = sys.argv[1:]
     if "--gh-repo" in args:
-        gh_repo = args[args.index("--gh-repo") + 1]
+        gh_repo = normalize_repo(args[args.index("--gh-repo") + 1])
 
     auth_file = find_auth_file()
     if not auth_file:
@@ -276,6 +288,21 @@ def main():
         return
 
     # 明文 token 只作为 stdin 传给 gh，不出现在命令行与进程列表中
+    if shutil.which("gh") is None:
+        # 没有 gh 不崩栈：降级为打印 token 并给出手动配置路径。
+        # 提示与 token 走同一流，保证管道/重定向时顺序正确、不会被截错。
+        print("\n[提示] 未检测到 GitHub CLI（gh），无法自动写入 Secret。")
+        print("请手动配置：")
+        print("  1) 复制下方 token")
+        print("  2) 打开 https://github.com/%s/settings/secrets/actions/new" % gh_repo)
+        print("  3) Name 填 WB_ACCESS_TOKEN，Secret 粘贴 token，保存")
+        print("如需自动写入，安装 gh CLI（https://cli.github.com/）后执行 gh auth login\n")
+        print("----- 以下为 token -----")
+        print(token)
+        print("----- 以上为 token -----")
+        print("\n[安全提醒] token 等同登录态，请勿粘贴到聊天、日志或任何第三方站点。", file=sys.stderr)
+        return
+
     proc = subprocess.run(
         ["gh", "secret", "set", "WB_ACCESS_TOKEN", "--repo", gh_repo, "--body", "-"],
         input=token.encode("utf-8"),

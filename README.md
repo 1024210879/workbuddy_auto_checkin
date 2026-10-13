@@ -25,14 +25,20 @@ refresh_token.py
 ### 2. 配置 Secret
 
 ```bash
-# token（由本机脚本直接写入，不经过命令行明文）
+# 有 gh CLI 时，token 经 stdin 直接写入，不经过命令行明文
 python refresh_token.py --gh-repo OWNER/REPO
 
 # 飞书机器人 webhook
 gh secret set FEISHU_WEBHOOK --repo OWNER/REPO --body "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx"
 ```
 
-也可以手动：本地运行 `python refresh_token.py` 打印 token，再粘进仓库 Settings → Secrets → `WB_ACCESS_TOKEN`。
+**没有 gh CLI**：脚本会自动降级为打印 token 并给出指引，不会报错退出。此时手动添加：
+
+1. `python refresh_token.py --gh-repo OWNER/REPO` 复制输出的 token（位于 `----- 以下为 token -----` 之间）
+2. 打开 `https://github.com/OWNER/REPO/settings/secrets/actions/new`
+3. Name 填 `WB_ACCESS_TOKEN`，Secret 粘贴 token，保存
+
+`OWNER/REPO` 可带 `.git` 或结尾 `/`，脚本会归一化；完整 URL 形式不受支持，请只传 `OWNER/REPO`。
 
 ### 3. 手动触发一次验证
 
