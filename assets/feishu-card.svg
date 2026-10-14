@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 220" width="520" height="220" role="img" aria-label="飞书通知卡片示意图：签到与猫猫旅行分两段汇报">
+  <style>
+    .card   { fill: #ffffff; stroke: #e5e7eb; stroke-width: 1.5; }
+    .head   { fill: #00b96b; }
+    .htitle { fill: #ffffff; }
+    .fg     { fill: #1f2328; }
+    .muted  { fill: #57606a; }
+    .dim    { fill: #8b949e; }
+    text    { font-family: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .card  { fill: #161b22; stroke: #30363d; }
+      .fg    { fill: #e6edf3; }
+      .muted { fill: #8b949e; }
+    }
+  </style>
+
+  <rect class="card" x="10" y="10" width="500" height="200" rx="12"/>
+
+  <!-- 顶部色条（仅上方圆角） -->
+  <path class="head" d="M22,10 H498 A12,12 0 0 1 510,22 V56 H10 V22 A12,12 0 0 1 22,10 Z"/>
+  <text class="htitle" x="32" y="39" font-size="15" font-weight="600">Buddy 加油站 · 成功</text>
+
+  <!-- 正文 -->
+  <text class="dim"   x="32" y="84"  font-size="13" font-weight="600">每日自动化</text>
+
+  <text class="fg"    x="32" y="112" font-size="14" font-weight="600">签到</text>
+  <text class="muted" x="32" y="134" font-size="12.5">今日已签过（今日 +100，连续 9 天，累计 900 积分）</text>
+
+  <text class="fg"    x="32" y="166" font-size="14" font-weight="600">猫猫旅行</text>
+  <text class="muted" x="32" y="188" font-size="12.5">领旅行礼物 +8 积分；今日旅行名额已用完，不再派出</text>
+</svg>

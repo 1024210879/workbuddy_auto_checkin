@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 570" width="720" height="570" role="img" aria-label="数据流：本机导出 token → GitHub Secret → Actions 定时执行 → 飞书推送">
+  <style>
+    .bg    { fill: #ffffff; }
+    .box   { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+    .boxhi { fill: #eef6ff; stroke: #b6d4fe; stroke-width: 1.5; }
+    .fg    { fill: #1f2328; }
+    .muted { fill: #57606a; }
+    .spine { stroke: #d0d7de; stroke-width: 2; }
+    .dot   { fill: #0969da; }
+    .lbl   { fill: #57606a; }
+    text   { font-family: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .bg    { fill: #0d1117; }
+      .box   { fill: #161b22; stroke: #30363d; }
+      .boxhi { fill: #12233a; stroke: #1f4b7a; }
+      .fg    { fill: #e6edf3; }
+      .muted { fill: #8b949e; }
+      .spine { stroke: #30363d; }
+      .dot   { fill: #58a6ff; }
+      .lbl   { fill: #8b949e; }
+    }
+  </style>
+
+  <rect class="bg" x="0" y="0" width="720" height="570" rx="12"/>
+
+  <!-- 主轴线 -->
+  <line class="spine" x1="120" y1="70" x2="120" y2="490"/>
+  <circle class="dot" cx="120" cy="70" r="8"/>
+  <circle class="dot" cx="120" cy="210" r="8"/>
+  <circle class="dot" cx="120" cy="350" r="8"/>
+  <circle class="dot" cx="120" cy="490" r="8"/>
+
+  <!-- 1. 本机 -->
+  <rect class="box" x="170" y="25" width="520" height="90" rx="10"/>
+  <text class="fg"    x="190" y="58"  font-size="15" font-weight="600">本机 · 一次性</text>
+  <text class="muted" x="190" y="84"  font-size="12.5">refresh_token.py：读登录态 → 本地解密 → 导出 token</text>
+
+  <!-- 2. Secret -->
+  <rect class="box" x="170" y="165" width="520" height="90" rx="10"/>
+  <text class="fg"    x="190" y="198" font-size="15" font-weight="600">GitHub Secret</text>
+  <text class="muted" x="190" y="224" font-size="12.5">WB_ACCESS_TOKEN / FEISHU_WEBHOOK　·　仓库内不含任何凭据</text>
+
+  <!-- 3. Actions -->
+  <rect class="boxhi" x="170" y="305" width="520" height="90" rx="10"/>
+  <text class="fg"    x="190" y="338" font-size="15" font-weight="600">GitHub Actions · 每天 3 次</text>
+  <text class="muted" x="190" y="364" font-size="12.5">wb_auto.py：签到 / 领奖 / 派出　·　HTTPS ↔ copilot.tencent.com</text>
+
+  <!-- 4. 飞书 -->
+  <rect class="box" x="170" y="445" width="520" height="90" rx="10"/>
+  <text class="fg"    x="190" y="478" font-size="15" font-weight="600">飞书群机器人</text>
+  <text class="muted" x="190" y="504" font-size="12.5">卡片分开汇报：签到结论 + 猫猫结论</text>
+
+  <!-- 连接标注 -->
+  <text class="lbl" x="146" y="145" font-size="12">gh secret</text>
+  <text class="lbl" x="146" y="285" font-size="12">cron 08:10 / 14:10 / 20:10</text>
+  <text class="lbl" x="146" y="425" font-size="12">webhook</text>
+</svg>
