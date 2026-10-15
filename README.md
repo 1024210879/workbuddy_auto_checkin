@@ -103,11 +103,9 @@ python refresh_token.py --gh-repo 你的用户名/workbuddy_auto_checkin
 python refresh_token.py
 ```
 
-屏幕上会打印一长串字符，
+屏幕上会打印一长串字符（下图涂黑的部分就是它），**完整复制它**，下一步手动粘进 GitHub。
 
-![token](C:\Users\Admin\WorkBuddy\2026-10-13-09-32-05\wb-auto\token.jpg)
-
-**完整复制它**，下一步手动粘进 GitHub。
+![](assets/refresh_token输出.jpg)
 
 
 
@@ -115,7 +113,7 @@ python refresh_token.py
 
 打开**你自己的仓库** → **Settings** → 左侧 **Secrets and variables** → **Actions** → 点绿色的 **New repository secret**：
 
-![](github_配置action的飞书、wb_access_token.png)
+![](assets/github_配置action的飞书、wb_access_token.png)
 
 需要填两条：
 
