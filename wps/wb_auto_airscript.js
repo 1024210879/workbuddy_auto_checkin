@@ -1,5 +1,5 @@
 /**
- * wb_auto_airscript.js —— 金山文档智能表格 AirScript 版每日自动化：签到 + 派猫猫旅行。
+ * wb_auto_airscript.js —— WPS AirScript 版每日自动化：签到 + 派猫猫旅行。
  *
  * 移植自 wb-auto 仓库的 wb_auto.py，逻辑完全一致：
  *   1. 先查签到状态，未签才领取（幂等：已签不重领）；
@@ -7,18 +7,21 @@
  *   3. 签到与猫猫分开汇报，猫猫失败不污染签到结论；
  *   4. 结果回写表格 + 推送飞书卡片。
  *
- * 配置（在名为「签到自动化」的工作表里，脚本会自动创建表头）：
+ * 配置（在名为「签到自动化」的工作表里，脚本会自动创建并写表头）：
  *   B1 = WB_ACCESS_TOKEN  （必填，由本机 refresh_token.py 导出，约 28 天更新一次）
  *   B2 = FEISHU_WEBHOOK   （选填，飞书群自定义机器人地址）
  *   B3 = WB_ENDPOINT      （选填，留空即默认 https://copilot.tencent.com）
  *   B5/B6/B7/B8 = 运行后自动回写：签到结论 / 猫猫结论 / 整体 / 上次运行时间
  *
  * 使用前提：脚本编辑器「服务」中已添加「网络 API」。
- * 兼容性：AirScript 1.0，ES5 风格（不用 class / 箭头函数 / async-await / 可选链）。
+ * 兼容性：同时兼容 AirScript 2.0（ET JSAPI：Value 是方法、Value2 可写、
+ * Worksheets.Add 四参）与 1.0（databook：Value 可写属性、Sheets.Add 五参、
+ * Application.Enum），全部走探测降级，不依赖任一特定实现。
  */
 
 var ENDPOINT_DEFAULT = "https://copilot.tencent.com";
 var SHEET_NAME = "签到自动化";
+var XL_WORKSHEET = -4167; // XlSheetType.xlWorksheet
 var MAX_RETRY = 3;
 var NO_NETWORK = -1;
 
@@ -364,51 +367,100 @@ function pushFeishu(webhook, title, checkinLine, buddyLine, overallOk) {
   }
 }
 
-// ---------------------------------------------------------------- 表格读写
+// ---------------------------------------------------------------- 表格读写（1.0 / 2.0 兼容层）
+//
+// 2.0（ET JSAPI）：Range.Value2 可读写；Range.Value 是方法（Value() 取值、
+//                 Value(null, x) 赋值）；Worksheets.Add(Before, After, Count, Type)；
+//                 Application.Enum 不存在。
+// 1.0（databook）：Range.Value 可直接赋值；Sheets.Add(..., Enum.XlSheetType.xlWorksheet, 名字)。
 
-function cellText(addr) {
-  try {
-    return String(Application.Range(addr).Text === undefined ? "" : Application.Range(addr).Text);
-  } catch (e) {
-    return "";
-  }
+function sheetsColl() {
+  if (Application.Sheets) return Application.Sheets;
+  if (Application.Worksheets) return Application.Worksheets;
+  return null;
 }
 
-function cellValue(addr) {
+function getSheet(name) {
+  var coll = sheetsColl();
+  if (!coll) return null;
+  try { return coll.Item(name); } catch (e1) {}
+  try { return coll(name); } catch (e2) {} // 某些实现支持 Sheets('名字') 函数形式
+  return null;
+}
+
+function activeSheetName() {
   try {
-    var v = Application.Range(addr).Value;
-    if (v === null || v === undefined) return "";
-    return String(v).replace(/^\s+|\s+$/g, "");
-  } catch (e) {
-    return cellText(addr).replace(/^\s+|\s+$/g, "");
+    if (Application.ActiveSheet && Application.ActiveSheet.Name) return Application.ActiveSheet.Name;
+  } catch (e) {}
+  return null;
+}
+
+function addSheet(name) {
+  var coll = sheetsColl();
+  if (!coll) return null;
+  var after = activeSheetName();
+  // databook 五参形式（名字随 Add 传入）
+  try { return coll.Add(null, after, 1, XL_WORKSHEET, name); } catch (e1) {}
+  // ET 四参形式：新建后改名
+  var s = null;
+  try { s = coll.Add(null, after, 1, XL_WORKSHEET); } catch (e2) {}
+  if (s) {
+    try { s.Name = name; return s; } catch (e3) { return s; }
   }
+  return null;
+}
+
+/** 确保配置表存在并激活；失败则退回当前表（返回 false 时靠日志提示用户）。 */
+function ensureSheet() {
+  var s = getSheet(SHEET_NAME);
+  if (!s) {
+    s = addSheet(SHEET_NAME);
+    if (!s) {
+      log("  无法创建「" + SHEET_NAME + "」工作表，将直接使用当前表");
+      return;
+    }
+    s = getSheet(SHEET_NAME) || s;
+  }
+  try { s.Activate(); } catch (e) {}
+}
+
+function rangeAt(addr) {
+  try { return Application.Range(addr); } catch (e1) {}
+  try { return Application.ActiveSheet.Range(addr); } catch (e2) {}
+  return null;
+}
+
+/** 归一化单元格读到的值：过滤函数/对象等实现差异产物。 */
+function cleanVal(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "function") return "";
+  if (Array.isArray(v)) {
+    var f = v[0];
+    v = (f && typeof f === "object" && Array.isArray(f)) ? f[0] : f;
+    if (v === null || v === undefined || typeof v === "object") return "";
+  }
+  if (typeof v === "object") return "";
+  return String(v).replace(/^\s+|\s+$/g, "");
+}
+
+function readCell(addr) {
+  var r = rangeAt(addr);
+  if (!r) return "";
+  var v;
+  try { v = r.Value2; var a = cleanVal(v); if (a !== "") return a; } catch (e1) {}
+  try { v = r.Value(); var b = cleanVal(v); if (b !== "") return b; } catch (e2) {}
+  try { v = r.Text; return cleanVal(v); } catch (e3) {}
+  return "";
 }
 
 function writeCell(addr, value) {
-  try {
-    Application.Range(addr).Value = value;
-  } catch (e) {
-    log("  写入 " + addr + " 失败：" + String(e));
-  }
-}
-
-/** 确保配置表存在并已激活；不存在则创建。 */
-function ensureSheet() {
-  try {
-    var s = Application.Sheets.Item(SHEET_NAME);
-    s.Activate();
-    return;
-  } catch (e) {
-    // 表不存在，走创建
-  }
-  try {
-    Application.Sheets.Add(null, Application.ActiveSheet.Name, 1,
-                           Application.Enum.XlSheetType.xlWorksheet, SHEET_NAME);
-    var s2 = Application.Sheets.Item(SHEET_NAME);
-    s2.Activate();
-  } catch (e) {
-    log("  创建工作表失败（将直接使用当前表）：" + String(e));
-  }
+  var r = rangeAt(addr);
+  if (!r) { log("  写入 " + addr + " 失败：取不到 Range"); return false; }
+  try { r.Value2 = value; return true; } catch (e1) {}
+  try { r.Value(null, value); return true; } catch (e2) {}
+  try { r.Value = value; return true; } catch (e3) {} // 1.0 可写属性
+  log("  写入 " + addr + " 失败：Value2 / Value 均不可写");
+  return false;
 }
 
 /** 写入表头与默认值（幂等：已有内容的格子不动）。 */
@@ -418,11 +470,11 @@ function ensureLabels() {
     A5: "签到结论", A6: "猫猫结论", A7: "整体", A8: "上次运行时间"
   };
   for (var addr in labels) {
-    if (Object.prototype.hasOwnProperty.call(labels, addr) && cellText(addr) === "") {
+    if (Object.prototype.hasOwnProperty.call(labels, addr) && readCell(addr) === "") {
       writeCell(addr, labels[addr]);
     }
   }
-  if (cellText("B3") === "") {
+  if (readCell("B3") === "") {
     writeCell("B3", ENDPOINT_DEFAULT);
   }
 }
@@ -444,12 +496,12 @@ function main() {
   ensureSheet();
   ensureLabels();
 
-  var token = cellValue("B1");
-  var webhook = cellValue("B2");
-  var endpoint = cellValue("B3") || ENDPOINT_DEFAULT;
+  var token = readCell("B1");
+  var webhook = readCell("B2");
+  var endpoint = readCell("B3") || ENDPOINT_DEFAULT;
 
   if (!token) {
-    log("缺少 token：请在 B1 粘贴 refresh_token.py 导出的凭证");
+    log("缺少 token：请在「" + SHEET_NAME + "」表的 B1 粘贴 refresh_token.py 导出的凭证");
     writeCell("B5", "❌ 缺少 token（B1）");
     writeCell("B8", nowBeijing());
     return;
