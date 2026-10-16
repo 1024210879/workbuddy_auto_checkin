@@ -6,9 +6,10 @@
 因此 token 必须由本机脚本导出，再写入仓库 Secret（绝不进仓库、绝不进日志）。
 
 用法：
-    python refresh_token.py                       # 只打印 token
+    python refresh_token.py                       # 打印 token + 手动配置指引
     python refresh_token.py --gh-repo OWNER/REPO  # 有 gh CLI 时直接写入 Secret
-                                                       没有 gh 则打印 token + 手动配置指引
+                                                  # 没有 gh 则打印 token + 手动配置指引
+（打包成 refresh_token.exe 后用法相同，双击运行等价于无参数形式）
 
 安全约定：
   - 明文 token 只出现在本进程内存与最终那一次目标位置；
@@ -283,35 +284,50 @@ def main():
     if not (isinstance(token, str) and TOKEN_RE.fullmatch(token)):
         raise SystemExit("token 格式异常")
 
-    if not gh_repo:
-        print(token)
+    # 有 gh 且指定了仓库 → 自动写入；否则统一走「指引 + 起止标记 + token」，
+    # 保证无论是终端跑 .py 还是双击 exe，输出结构一致、都能照着做
+    if gh_repo and shutil.which("gh") is not None:
+        # 明文 token 只作为 stdin 传给 gh，不出现在命令行与进程列表中
+        proc = subprocess.run(
+            ["gh", "secret", "set", "WB_ACCESS_TOKEN", "--repo", gh_repo, "--body", "-"],
+            input=token.encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            raise SystemExit("写入 GitHub Secret 失败：" + proc.stderr.decode("utf-8", "replace"))
+        print("已写入 GitHub Secret WB_ACCESS_TOKEN（仓库 %s）" % gh_repo)
         return
 
-    # 明文 token 只作为 stdin 传给 gh，不出现在命令行与进程列表中
-    if shutil.which("gh") is None:
-        # 没有 gh 不崩栈：降级为打印 token 并给出手动配置路径。
-        # 提示与 token 走同一流，保证管道/重定向时顺序正确、不会被截错。
+    if gh_repo:
         print("\n[提示] 未检测到 GitHub CLI（gh），无法自动写入 Secret。")
-        print("请手动配置：")
-        print("  1) 复制下方 token")
+    print("\n请手动配置：")
+    print("  1) 复制下方两个标记之间的 token")
+    if gh_repo:
         print("  2) 打开 https://github.com/%s/settings/secrets/actions/new" % gh_repo)
         print("  3) Name 填 WB_ACCESS_TOKEN，Secret 粘贴 token，保存")
-        print("如需自动写入，安装 gh CLI（https://cli.github.com/）后执行 gh auth login\n")
-        print("----- 以下为 token -----")
-        print(token)
-        print("----- 以上为 token -----")
-        print("\n[安全提醒] token 等同登录态，请勿粘贴到聊天、日志或任何第三方站点。", file=sys.stderr)
-        return
+        print("如需自动写入，安装 gh CLI（https://cli.github.com/）后执行 gh auth login")
+    else:
+        print("  2) GitHub Actions 版：你仓库的 Settings → Secrets and variables → Actions，"
+             "新建 WB_ACCESS_TOKEN 并粘贴")
+        print("     WPS 金山文档版：「签到自动化」表的 B1 单元格粘贴")
+    print("\n----- 以下为 token -----")
+    print(token)
+    print("----- 以上为 token -----")
+    print("\n[安全提醒] token 等同登录态，请勿粘贴到聊天、日志或任何第三方站点。", file=sys.stderr)
 
-    proc = subprocess.run(
-        ["gh", "secret", "set", "WB_ACCESS_TOKEN", "--repo", gh_repo, "--body", "-"],
-        input=token.encode("utf-8"),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        raise SystemExit("写入 GitHub Secret 失败：" + proc.stderr.decode("utf-8", "replace"))
-    print("已写入 GitHub Secret WB_ACCESS_TOKEN（仓库 %s）" % gh_repo)
+
+def _pause_if_frozen():
+    """打包成 exe 被双击运行时，结束前停一下，让用户来得及复制输出。"""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        input("\n按回车键退出…")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        _pause_if_frozen()

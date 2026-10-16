@@ -4,6 +4,19 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 
 跑在 GitHub Actions 上，按 cron 每天定时执行，不需要任何常开设备。
 
+> **两种运行方式，签到逻辑完全一致，二选一：**
+>
+> | | GitHub Actions 版（本 README） | [WPS 金山文档版](wps/README.md) |
+> | --- | --- | --- |
+> | 适合 | 习惯 GitHub 的用户 | **不想碰 GitHub / 零命令行** 的用户 |
+> | 托管 | GitHub Actions 免费定时任务 | 金山文档智能表格脚本 + 免费定时任务 |
+> | 配置 | Fork 仓库 + 填两个 Secret | 建表格 → 粘脚本 → 填两个单元格 |
+> | 结果 | Actions 日志 / 飞书卡片 | 直接回写表格 / 飞书卡片 |
+>
+> 两种版本的 token 都由本机导出一次（[第 4 步](#第-4-步导出登录凭证二选一)）：
+> 装了 Python 就跑 `refresh_token.py`；没装 Python 直接下载仓库里的
+> **`refresh_token.exe`** 双击运行，无需任何环境。
+
 ## 特性
 
 - **云端定时** — 免费 runner + `schedule` 触发，本机关机照常执行
@@ -45,7 +58,7 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 - 一个 GitHub 账号
 - 一台装过 WorkBuddy **并且登录过**的电脑（只在配置时用一次）
 - 一个飞书群（自己建一个只有自己的也行），用来收消息
-- 电脑上有 Python 3.8+
+- 电脑上有 Python 3.8+（没有也行——用仓库里的 `refresh_token.exe`，见第 4 步）
 
 ### 容易搞混的一点，先说清楚
 
@@ -85,6 +98,11 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 
 ### 第 4 步：导出登录凭证（二选一）
 
+**先选运行形式：**
+
+- **没装 Python？** 直接双击仓库里的 **`refresh_token.exe`**（用法与 `.py` 完全一致，把下面命令里的 `python refresh_token.py` 换成 `refresh_token.exe` 即可）。首次运行 Windows SmartScreen 可能拦截，点 **更多信息 → 仍要运行**。
+- 装了 Python：继续往下按命令操作（脚本零第三方依赖，只需 Python 3.8+）。
+
 **方式 A：电脑上装了 gh CLI —— 自动写入，最省事**
 
 在项目文件夹里运行：
@@ -103,7 +121,7 @@ python refresh_token.py --gh-repo 你的用户名/workbuddy_auto_checkin
 python refresh_token.py
 ```
 
-屏幕上会打印一长串字符（下图涂黑的部分就是它），**完整复制它**，下一步手动粘进 GitHub。
+屏幕上会打印一长串字符（下图涂黑的部分就是它），**完整复制 `----- 以下为 token -----` 到 `----- 以上为 token -----` 之间**的内容，下一步手动粘进 GitHub。
 
 ![](assets/refresh_token输出.jpg)
 
@@ -204,8 +222,13 @@ POST /v2/activity/growth/buddy/travel/depart     派出一趟
 ```text
 wb_auto.py                    云端执行主体：签到、领奖、派出、推送
 refresh_token.py              本机一次性操作：导出 token / 写入 Secret
+refresh_token.exe             上者的免 Python 打包版（Windows x64，双击即用）
 .github/workflows/daily.yml   cron 定义与执行步骤
+wps/                          WPS 金山文档版（脚本 + 说明，见 wps/README.md）
 ```
+
+> `refresh_token.exe` 由 `refresh_token.py` 经 PyInstaller 打包（零第三方依赖），
+> 每次改动 `.py` 后需要重新构建。未做代码签名，SmartScreen 的提示属正常现象。
 
 ## 安全设计
 
@@ -217,7 +240,7 @@ refresh_token.py              本机一次性操作：导出 token / 写入 Secr
 
 ## 常见问题
 
-**令牌过期** — token 由客户端签发，有效期约 28 天（`expiresIn` 2419200）。日志或飞书出现「认证被拒」时，本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库）。
+**令牌过期** — token 由客户端签发，有效期约 28 天（`expiresIn` 2419200）。日志或飞书出现「认证被拒」时，本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；exe 同理：`refresh_token.exe --gh-repo OWNER/REPO`）。
 
 **fork 之后 Actions 页签是空的** — fork 来的仓库默认不启用 Actions。进 Actions 页签，点页面中间的 **I understand my workflows, go ahead and enable them** 启用一次即可。
 
