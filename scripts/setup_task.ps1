@@ -9,11 +9,17 @@
 
     需要先安装 GitHub CLI 并登录：winget install --id GitHub.cli && gh auth login
 
+    多账号：同一个仓库托管多个 WorkBuddy 账号时，用 -Account 指定本机
+    对应哪个账号（令牌会写进 WB_ACCESS_TOKEN_<ID>）。
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 用户名/仓库名
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 用户名/仓库名 -RunNow
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 用户名/仓库名 -Account WORK
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Uninstall
@@ -22,6 +28,9 @@
 param(
     # 你的仓库，形如 用户名/workbuddy_auto_checkin（仅 -Uninstall 时可省略）
     [string]$Repo = "",
+
+    # 多账号：本机对应哪个账号（令牌写入 WB_ACCESS_TOKEN_<ID>）；留空写 WB_ACCESS_TOKEN
+    [string]$Account = "",
 
     # 令牌剩余不足这么多天就不再同步，避免把快过期的写进 Secret
     [double]$MinDays = 3,
@@ -41,16 +50,32 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$TaskName = "WorkBuddyTokenRefresh"
+# 账号 id 会拼进 Secret 名，先归一化再用于任务名、日志名、启动项名
+$Account = ($Account -as [string])
+if ($null -eq $Account) { $Account = "" }
+$Account = $Account.Trim().ToUpper()
+if ($Account -and $Account -notmatch '^[A-Z0-9_]{1,32}$') {
+    Write-Host "[x] -Account 只允许字母、数字、下划线，1~32 位（例如 WORK）" -ForegroundColor Red
+    exit 1
+}
+
+$suffix = ""
+$secretName = "WB_ACCESS_TOKEN"
+if ($Account) {
+    $suffix = "-" + $Account
+    $secretName = "WB_ACCESS_TOKEN_" + $Account
+}
+
+$TaskName = "WorkBuddyTokenRefresh" + $suffix
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = Split-Path -Parent $scriptDir
 $pyScript = Join-Path $root "refresh_token.py"
 $logDir = Join-Path $env:LOCALAPPDATA "workbuddy_auto_checkin"
-$logFile = Join-Path $logDir "refresh.log"
+$logFile = Join-Path $logDir ("refresh" + $suffix + ".log")
 $startupDir = [Environment]::GetFolderPath("Startup")
-$startupVbs = Join-Path $startupDir "WorkBuddyTokenRefresh.vbs"
-$cmdFile = Join-Path $scriptDir "run_refresh.cmd"
+$startupVbs = Join-Path $startupDir ("WorkBuddyTokenRefresh" + $suffix + ".vbs")
+$cmdFile = Join-Path $scriptDir ("run_refresh" + $suffix + ".cmd")
 
 function Install-StartupLauncher {
     <#
@@ -95,7 +120,17 @@ if ($Uninstall) {
         Write-Host "[OK] 已移除登录启动项：$startupVbs" -ForegroundColor Green
         $removed = $true
     }
-    if (-not $removed) { Write-Host "[--] 没找到已注册的计划任务或启动项" }
+    if (-not $removed) { Write-Host "[--] 没找到已注册的计划任务或启动项：$TaskName" }
+    # 多账号时其它账号各自的启动项不会被这条命令带走，提示一下免得以为清干净了
+    $others = @()
+    foreach ($f in (Get-ChildItem -LiteralPath $startupDir -Filter "WorkBuddyTokenRefresh-*.vbs" -ErrorAction SilentlyContinue)) {
+        $others += ("  " + $f.Name + "  →  powershell -File scripts\setup_task.ps1 -Uninstall -Account " +
+            ($f.BaseName -replace '^WorkBuddyTokenRefresh-', ''))
+    }
+    if ($others.Count -gt 0) {
+        Write-Host "[提示] 本机还有其它账号的登录启动项，如需一并移除：" -ForegroundColor Yellow
+        $others | ForEach-Object { Write-Host $_ }
+    }
     return
 }
 
@@ -142,7 +177,9 @@ if (-not $launcher) {
 $arguments = @()
 $arguments += $prefix
 $arguments += "`"$pyScript`""
-$arguments += @("--gh-repo", $Repo, "--min-days", $MinDays, "--wait", $WaitSeconds, "--log", "`"$logFile`"")
+$arguments += @("--gh-repo", $Repo)
+if ($Account) { $arguments += @("--account", $Account) }
+$arguments += @("--min-days", $MinDays, "--wait", $WaitSeconds, "--log", "`"$logFile`"")
 $argumentLine = ($arguments | ForEach-Object { $_.ToString() }) -join " "
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -165,9 +202,10 @@ $settings = New-ScheduledTaskSettingsSet `
 try {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
         -Settings $settings -Force -ErrorAction Stop `
-        -Description "把本机 WorkBuddy 令牌同步到 GitHub Secret（含过期闸门）" | Out-Null
+        -Description "把本机 WorkBuddy 令牌同步到 GitHub Secret $secretName（含过期闸门）" | Out-Null
 
     Write-Host "[OK] 已注册计划任务：$TaskName" -ForegroundColor Green
+    Write-Host "     Secret：$secretName$(if ($Account) { "（账号 $Account）" })"
     Write-Host "     启动器：$launcher"
     Write-Host "     参数  ：$argumentLine"
     Write-Host "     触发  ：登录后 2 分钟$(if ($DailyTime) { " + 每天 $DailyTime" })"
@@ -180,6 +218,7 @@ try {
         Write-Host "    如要使用计划任务，请以管理员身份打开 PowerShell 后重跑本脚本。" -ForegroundColor Red
         exit 1
     }
+    Write-Host "     Secret：$secretName$(if ($Account) { "（账号 $Account）" })"
     Write-Host "     日志  ：$logFile"
     Write-Host "     说明  ：登录启动没有「每日兜底」，只要你每天登录一次即可。" -ForegroundColor DarkGray
 }

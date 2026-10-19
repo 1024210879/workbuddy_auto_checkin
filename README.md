@@ -20,6 +20,7 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 ## 特性
 
 - **云端定时** — 免费 runner + `schedule` 触发，本机关机照常执行
+- **多账号** — 一个仓库托管多个 WorkBuddy 账号，各用一份令牌、各推一张卡片
 - **一次做两件事** — 签到与成长中心旅行在同一次运行里完成
 - **幂等** — 先查状态再决定是否领取；已签不重领，已派不重派
 - **结论解耦** — 猫猫模块任何异常都不影响签到结论；整体成败只看签到
@@ -152,6 +153,68 @@ python refresh_token.py
 
 > 这个页面显示绿色不代表签到一定成功（猫猫出问题不影响整体结论）。**以飞书收到的消息为准。**
 
+## 多账号（一个仓库跑多个 WorkBuddy）
+
+同一个仓库可以托管多个账号的签到，互不干扰：各自一份 token、各自一张飞书卡片、各自独立的运行记录；一个账号失败不影响其它账号。
+
+### 要配的东西只有两样
+
+**① 每个账号一条令牌 Secret**
+
+| 账号 id | 令牌 Secret | 卡片推到哪 |
+| --- | --- | --- |
+| `MAIN`（默认，可省略不写） | `WB_ACCESS_TOKEN` | `FEISHU_WEBHOOK` |
+| `WORK` | `WB_ACCESS_TOKEN_WORK` | `FEISHU_WEBHOOK_WORK`（可省略，省略即用全局的 `FEISHU_WEBHOOK`） |
+
+规则很直白：**`WB_ACCESS_TOKEN_` + 大写的账号 id**。
+
+**② 一份账号清单（仓库变量，不是 Secret）**
+
+仓库 → Settings → Secrets and variables → Actions → **Variables** 页签 → **New repository variable**：
+
+| Name | Value |
+| --- | --- |
+| `WB_ACCOUNTS` | `[{"id":"MAIN","label":"主号"},{"id":"WORK","label":"工作号"}]` |
+
+`label` 只影响飞书卡片标题和 Actions 里的任务名，随便起。这个变量**不含任何凭据**，所以放在 Variables 而不是 Secrets。
+
+> **不建这个变量也能跑**：workflow 会退化成单账号模式，直接用 `WB_ACCESS_TOKEN`，与你现在的用法完全一致。想加号时才需要它。
+
+### 每台机器各自导出自己的那份
+
+token 只能由登录了该账号的客户端解出来，所以**一个账号对应一台电脑**：
+
+```text
+# 主号那台（不写 --account，仍然写 WB_ACCESS_TOKEN）
+python refresh_token.py --gh-repo 1024210879/workbuddy_auto_checkin
+
+# 工作号那台
+python refresh_token.py --gh-repo 1024210879/workbuddy_auto_checkin --account WORK
+```
+
+自动续期同样按账号来，账号 id 会一并固化进启动项：
+
+```text
+powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 1024210879/workbuddy_auto_checkin -Account WORK
+```
+
+### 加号前后会变什么
+
+- **执行方式**：workflow 先读 `WB_ACCOUNTS`，再按账号矩阵**并行**跑；每个账号一个 job，日志、step summary 分开，`fail-fast: false` 保证互不牵连
+- **飞书卡片标题**变成 `Buddy 加油站 · 工作号 · 成功`，多个账号的卡片混在一个群里也分得清
+- **并发控制**：同一账号的多个时段仍然串行（`wb-daily-<ID>`），不同账号之间互不阻塞
+- **令牌缺失不会串号**：某个账号的 Secret 没配，那个 job 直接报「Secret `WB_ACCESS_TOKEN_WORK` 没有值」并退出，不会偷偷用别的账号的令牌
+
+### 几个容易踩的点
+
+| 情况 | 说明 |
+| --- | --- |
+| id 大小写 | 统一转大写，`work` 与 `WORK` 是同一个账号；只允许字母、数字、下划线 |
+| 想换 Secret 名 | 在清单里加 `"secret":"MY_TOKEN"` 显式指定，不再按默认规则拼 |
+| 一台机器两个账号 | 需要两套客户端登录态（各自的凭据文件），实际很少见；真要用就给其中一份设 `WORKBUDDY_AUTH_FILE` 指向不同文件 |
+| 私有仓库额度 | 每个账号每天 3 次运行，矩阵会成倍消耗额度（公开仓库不计时） |
+| 加号后记得验证 | 手动 Run workflow 一次，看是不是每个账号各出一张卡片 |
+
 ## 令牌自动续期（可选）
 
 token 有效期 28 天。手动重跑一次脚本能用一个月，但很容易忘。做成本机计划任务后就不用再管。
@@ -207,7 +270,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 | 已经过期 | **跳过，不动 Secret**，提示先启动客户端 | 4 |
 | 该令牌已推送过（比对本地记录） | 跳过，省一次 API 调用 | 0 |
 
-本地只在 `%LOCALAPPDATA%\workbuddy_auto_checkin\state.json` 记一个「已推送令牌的过期时刻」，不含任何凭据。日志里也不会出现明文 token。
+本地只在 `%LOCALAPPDATA%\workbuddy_auto_checkin\state.json` 里按 Secret 名分别记「已推送令牌的过期时刻」，不含任何凭据。多账号时各记各的，不会互相把对方判成「已推送」。日志里也不会出现明文 token。
 
 所以最坏的情况是：你出差一个月回来，任务跳过了一次，Secret 里仍是你离开前那枚——重新打开 WorkBuddy（客户端自动续期）后，下一轮触发就会把新令牌同步上去，无需手工操作。
 
@@ -228,12 +291,18 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 | `FEISHU_WEBHOOK` | 建议 | — | 飞书自定义机器人地址。缺失则不推送，仅打印日志 |
 | `WB_ENDPOINT` | 否 | `https://copilot.tencent.com` | 接口地址 |
 | `WB_RESULT_FILE` | 否 | — | 写入 Markdown 汇总表，供 Actions 的 step summary 使用 |
+| `WB_ACCOUNT` | 否 | — | 账号 id，由 workflow 从矩阵注入，只用于日志与排错 |
+| `WB_ACCOUNT_LABEL` | 否 | — | 账号显示名，进飞书卡片标题与 step summary |
+| `WB_TOKEN_SECRET` | 否 | — | 该账号对应的 Secret 名，只用于「令牌为空」时的提示文案 |
+
+后三项由 workflow 自动注入，手动本机运行 `wb_auto.py` 时不必设置。
 
 ### 本机侧（`refresh_token.py`）
 
 | 参数 | 说明 |
 | --- | --- |
 | `--gh-repo OWNER/REPO` | 直接写入仓库 Secret（需要 gh CLI） |
+| `--account ID` | 多账号：写入 `WB_ACCESS_TOKEN_<ID>`（id 自动转大写）。不带则写 `WB_ACCESS_TOKEN` |
 | `--min-days N` | 令牌剩余不足 N 天就不推送（默认 3），避免写入将过期的令牌 |
 | `--wait SEC` | 登录后客户端尚未刷新完时，最多轮询等待这么多秒 |
 | `--check` | 只检查令牌新鲜度，不做任何写入 |
@@ -276,7 +345,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 | --- | --- |
 | `0` | 签到成功 |
 | `1` | 签到未达成（猫猫失败不在此列） |
-| `2` | 缺少 `WB_ACCESS_TOKEN` |
+| `2` | 缺少令牌（该账号的 Secret 没有值，日志会指出具体是哪一个） |
 
 workflow 中脚本以 `exit 0` 收尾，只对未完成项发 `::warning::`，因此一次运行显示绿色不代表签到一定成功——**以日志、step summary 与飞书卡片为准**。
 

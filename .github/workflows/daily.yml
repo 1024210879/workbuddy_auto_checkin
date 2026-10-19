@@ -20,14 +20,87 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: wb-daily
-  cancel-in-progress: false
-
 jobs:
-  daily:
+  # ---------------------------------------------------------------- 账号清单
+  # 仓库变量 WB_ACCOUNTS（注意是 Variables 不是 Secrets）决定要跑几个账号：
+  #   [{"id":"MAIN","label":"主号"},{"id":"WORK","label":"工作号"}]
+  # 不设置该变量时，按单账号模式跑（沿用旧的 WB_ACCESS_TOKEN）。
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.accounts.outputs.matrix }}
+    steps:
+      - name: 解析账号清单
+        id: accounts
+        env:
+          RAW: ${{ vars.WB_ACCOUNTS }}
+        run: |
+          set -euo pipefail
+          python3 - "$RAW" >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import re
+          import sys
+
+          raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+
+          def fail(msg):
+              sys.exit("WB_ACCOUNTS 配置有误：" + msg)
+
+          # 未配置变量时按单账号跑，等价于旧行为
+          if not raw:
+              raw = '[{"id":"MAIN","label":"默认账号"}]'
+
+          try:
+              data = json.loads(raw)
+          except ValueError as e:
+              fail("不是合法 JSON（%s）" % e)
+          if isinstance(data, dict):
+              data = [data]
+          if not isinstance(data, list) or not data:
+              fail('必须是 JSON 数组，例如 [{"id":"MAIN","label":"主号"}]')
+
+          accounts = []
+          for i, item in enumerate(data):
+              if isinstance(item, str):
+                  item = {"id": item}
+              if not isinstance(item, dict):
+                  fail("第 %d 项不是对象" % (i + 1))
+              aid = str(item.get("id") or "").strip().upper()
+              if not re.fullmatch(r"[A-Z0-9_]{1,32}", aid):
+                  fail("第 %d 项的 id 非法：只允许 A-Z 0-9 _，1~32 位" % (i + 1))
+              label = str(item.get("label") or aid).replace("\r", " ").replace("\n", " ").strip()
+              secret = str(item.get("secret") or "").strip()
+              # 默认取 WB_ACCESS_TOKEN_<ID>；MAIN 兼容单账号时期的旧名字
+              if not secret:
+                  secret = "WB_ACCESS_TOKEN" if aid == "MAIN" else "WB_ACCESS_TOKEN_" + aid
+              accounts.append({"id": aid, "label": label or aid, "secret": secret})
+
+          ids = [a["id"] for a in accounts]
+          dup = sorted({x for x in ids if ids.count(x) > 1})
+          if dup:
+              fail("id 重复：%s" % ", ".join(dup))
+
+          # 单行 JSON：GITHUB_OUTPUT 不支持多行值
+          print("matrix=" + json.dumps(accounts, ensure_ascii=False, separators=(",", ":")))
+          for a in accounts:
+              print("  · %s（%s）→ Secret %s" % (a["label"], a["id"], a["secret"]), file=sys.stderr)
+          PY
+
+  # ---------------------------------------------------------------- 逐账号执行
+  run:
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    name: 签到 · ${{ matrix.label }}
+    strategy:
+      fail-fast: false          # 一个账号失败不影响其它账号
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    # 按账号分组：同一账号的不同时段仍然串行，不同账号之间互不阻塞
+    concurrency:
+      group: wb-daily-${{ matrix.id }}
+      cancel-in-progress: false
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -48,10 +121,15 @@ jobs:
       - name: 执行签到与派猫猫
         id: run
         env:
-          WB_ACCESS_TOKEN: ${{ secrets.WB_ACCESS_TOKEN }}
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          # 每个账号取自己那份 Secret；缺失时为空字符串，由脚本明确报错（exit 2）
+          WB_ACCESS_TOKEN: ${{ secrets[matrix.secret] }}
+          # 账号专属 webhook 优先，没配就用全局的
+          FEISHU_WEBHOOK: ${{ secrets[format('FEISHU_WEBHOOK_{0}', matrix.id)] || secrets.FEISHU_WEBHOOK }}
+          WB_ACCOUNT: ${{ matrix.id }}
+          WB_ACCOUNT_LABEL: ${{ matrix.label }}
+          WB_TOKEN_SECRET: ${{ matrix.secret }}
           WB_ENDPOINT: https://copilot.tencent.com
-          WB_RESULT_FILE: ${{ runner.temp }}/wb_result.json
+          WB_RESULT_FILE: ${{ runner.temp }}/wb_result_${{ matrix.id }}.md
         run: |
           set -uo pipefail
           PY="${{ steps.py.outputs.python_path }}"
@@ -63,19 +141,24 @@ jobs:
           # 签到成功即成功：脚本自身已把猫猫失败与签到结论解耦，
           # 这里统一以 0 退出，仅用 warning 提示存在未完成项。
           if [ "$code" -ne 0 ]; then
-            echo "::warning::本轮存在未完成项，详见上方日志与飞书卡片"
+            echo "::warning::$WB_ACCOUNT_LABEL 本轮存在未完成项，详见上方日志与飞书卡片"
           fi
           exit 0
 
       - name: 汇总
         if: always()
         env:
-          RESULT_FILE: ${{ runner.temp }}/wb_result.json
+          RESULT_FILE: ${{ runner.temp }}/wb_result_${{ matrix.id }}.md
+          # 账号信息走环境变量而不是直接插进脚本：变量名拼错或含特殊字符都不会变成 shell 代码
+          ACCOUNT_ID: ${{ matrix.id }}
+          ACCOUNT_LABEL: ${{ matrix.label }}
+          ACCOUNT_SECRET: ${{ matrix.secret }}
         run: |
           set -uo pipefail
           {
-            echo "### Buddy 加油站每日自动化"
+            echo "### Buddy 加油站每日自动化 · $ACCOUNT_LABEL"
             echo ""
+            echo "- 账号：$ACCOUNT_ID（Secret $ACCOUNT_SECRET）"
             echo "- 运行时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')（cron 为 UTC）"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -f "$RESULT_FILE" ]; then

@@ -10,11 +10,17 @@
     python refresh_token.py --gh-repo OWNER/REPO  # 有 gh CLI 时直接写入 Secret
                                                   # 没有 gh 则打印 token + 手动配置指引
 
+多账号（同一个仓库托管多个 WorkBuddy 账号）：
+    python refresh_token.py --gh-repo OWNER/REPO --account WORK
+    写入 WB_ACCESS_TOKEN_WORK。不带 --account 时仍写 WB_ACCESS_TOKEN（单账号 / 主号）。
+
 自动续期（配合开机计划任务，见 scripts/setup_task.ps1）：
     python refresh_token.py --gh-repo OWNER/REPO --log 日志路径
     每次开机跑一遍即可：客户端启动时已自动刷新凭据，本脚本只负责同步到 Secret。
 
     可选参数：
+      --account ID   把令牌写入 WB_ACCESS_TOKEN_ID（多账号时用来区分）。
+                     只允许 A-Z 0-9 _，会统一转成大写。
       --min-days N   令牌剩余不足 N 天时不推送（默认 3）。防止把将过期/已过期的
                      token 写进 Secret，覆盖掉里面还有效的那一枚。
       --wait SEC     登录后客户端可能尚未刷新完，最多等待 SEC 秒轮询凭据变化。
@@ -49,6 +55,8 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/-]+=*")
 
 DEFAULT_MIN_DAYS = 3.0        # 剩余不足这么多天就不再推送，避免写入快过期的 token
 POLL_INTERVAL = 5.0           # --wait 期间轮询凭据文件的间隔
+DEFAULT_SECRET = "WB_ACCESS_TOKEN"   # 单账号 / 主号用的 Secret 名
+ACCOUNT_RE = re.compile(r"[A-Z0-9_]{1,32}")
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_STALE = 3                # 令牌不新鲜，主动跳过（不是错误，不改写 Secret）
@@ -298,6 +306,20 @@ def normalize_repo(value):
     return repo
 
 
+def normalize_account(value):
+    """账号 id 会拼进 Secret 名，只允许字母数字下划线，统一转大写。"""
+    account = value.strip().upper()
+    if not ACCOUNT_RE.fullmatch(account):
+        raise SystemExit(
+            "账号 id 只允许字母、数字、下划线，1~32 位（会拼成 WB_ACCESS_TOKEN_<ID>），收到：%s" % value)
+    return account
+
+
+def secret_name(account):
+    """账号 → Secret 名。不给账号时沿用单账号时期的 WB_ACCESS_TOKEN。"""
+    return DEFAULT_SECRET if not account else DEFAULT_SECRET + "_" + account
+
+
 class _Tee:
     """把 stdout/stderr 同时写向日志文件与原控制台（有控制台时）。"""
 
@@ -358,12 +380,12 @@ def install_log(path):
 
 def parse_args(argv):
     opts = {"gh_repo": None, "min_days": DEFAULT_MIN_DAYS, "check": False,
-            "force": False, "log": None, "wait": 0.0}
+            "force": False, "log": None, "wait": 0.0, "account": ""}
     numeric = {"--min-days": "min_days", "--wait": "wait"}
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in ("--gh-repo", "--log") or arg in numeric:
+        if arg in ("--gh-repo", "--log", "--account") or arg in numeric:
             if i + 1 >= len(argv):
                 raise SystemExit("参数 %s 缺少取值" % arg)
             value = argv[i + 1]
@@ -372,6 +394,8 @@ def parse_args(argv):
                 opts["gh_repo"] = normalize_repo(value)
             elif arg == "--log":
                 opts["log"] = value
+            elif arg == "--account":
+                opts["account"] = normalize_account(value)
             else:
                 try:
                     num = float(value)
@@ -386,7 +410,7 @@ def parse_args(argv):
         elif arg == "--force":
             opts["force"] = True
         else:
-            raise SystemExit("未知参数：%s（可用：--gh-repo --min-days --wait --check --force --log）" % arg)
+            raise SystemExit("未知参数：%s（可用：--gh-repo --account --min-days --wait --check --force --log）" % arg)
         i += 1
     return opts
 
@@ -417,13 +441,42 @@ def read_state():
         return {}
 
 
-def write_state(expires_at):
+def pushed_expiry(secret):
+    """该 Secret 上次推送的令牌过期时刻；没有记录返回 None。
+
+    多账号时按 Secret 名分开记，否则两个账号会互相把对方判成「已推送」。
+    """
+    state = read_state()
+    pushed = state.get("pushed")
+    if isinstance(pushed, dict):
+        entry = pushed.get(secret)
+        if isinstance(entry, dict):
+            entry = entry.get("expires_at")
+        if isinstance(entry, (int, float)) and not isinstance(entry, bool):
+            return float(entry)
+        return None
+    # 兼容单账号时期的旧格式：全局只有一条记录
+    legacy = state.get("pushed_expires_at")
+    if secret == DEFAULT_SECRET and isinstance(legacy, (int, float)) and not isinstance(legacy, bool):
+        return float(legacy)
+    return None
+
+
+def write_state(secret, expires_at):
     """只记录「已推送令牌的过期时刻」，不含任何凭据内容。"""
+    state = read_state()
+    pushed = state.get("pushed")
+    if not isinstance(pushed, dict):
+        pushed = {}
+    pushed[secret] = {"expires_at": expires_at,
+                      "pushed_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    state["pushed"] = pushed
+    state.pop("pushed_expires_at", None)     # 旧格式字段，迁移后不再需要
+    state.pop("pushed_at", None)
     try:
         os.makedirs(_data_dir(), exist_ok=True)
         with open(os.path.join(_data_dir(), "state.json"), "w", encoding="utf-8") as f:
-            json.dump({"pushed_expires_at": expires_at,
-                       "pushed_at": datetime.datetime.now().isoformat(timespec="seconds")}, f)
+            json.dump(state, f, ensure_ascii=False, indent=1)
     except OSError:
         pass
 
@@ -451,9 +504,11 @@ def wait_for_refresh(path, session, seconds):
 
 def main():
     opts = parse_args(sys.argv[1:])
+    secret = secret_name(opts["account"])
     log_path, _ = install_log(opts["log"])
     if log_path:
         print("日志：%s" % log_path)
+    print("目标 Secret：%s%s" % (secret, "（账号 %s）" % opts["account"] if opts["account"] else ""))
 
     auth_file = find_auth_file()
     if not auth_file:
@@ -494,10 +549,10 @@ def main():
         print("[检查] --check 模式，不做任何写入")
         return EXIT_OK
 
-    # ---- 去重：这个令牌已经推送过就不再重复调用 GitHub ----
+    # ---- 去重：这枚令牌已经推送过就不再重复调用 GitHub（按 Secret 名分开记）----
     if not opts["force"] and expires_at is not None:
-        if read_state().get("pushed_expires_at") == expires_at:
-            print("[跳过] 该令牌（%s 到期）此前已推送过，无需重复写入" % when)
+        if pushed_expiry(secret) == expires_at:
+            print("[跳过] 该令牌（%s 到期）此前已推送过 %s，无需重复写入" % (when, secret))
             return EXIT_OK
 
     token = dig_session(session, "auth", "accessToken")
@@ -516,14 +571,14 @@ def main():
     if opts["gh_repo"] and shutil.which("gh") is not None:
         # 明文 token 只作为 stdin 传给 gh，不出现在命令行与进程列表中
         proc = subprocess.run(
-            ["gh", "secret", "set", "WB_ACCESS_TOKEN", "--repo", opts["gh_repo"], "--body", "-"],
+            ["gh", "secret", "set", secret, "--repo", opts["gh_repo"], "--body", "-"],
             input=token.encode("utf-8"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         if proc.returncode != 0:
             raise SystemExit("写入 GitHub Secret 失败：" + proc.stderr.decode("utf-8", "replace"))
-        write_state(expires_at)
-        print("已写入 GitHub Secret WB_ACCESS_TOKEN（仓库 %s）" % opts["gh_repo"])
+        write_state(secret, expires_at)
+        print("已写入 GitHub Secret %s（仓库 %s）" % (secret, opts["gh_repo"]))
         return EXIT_OK
 
     if opts["gh_repo"]:
@@ -541,11 +596,11 @@ def main():
     print("  1) 复制下方两个标记之间的 token")
     if opts["gh_repo"]:
         print("  2) 打开 https://github.com/%s/settings/secrets/actions/new" % opts["gh_repo"])
-        print("  3) Name 填 WB_ACCESS_TOKEN，Secret 粘贴 token，保存")
+        print("  3) Name 填 %s，Secret 粘贴 token，保存" % secret)
         print("如需自动写入，安装 gh CLI（https://cli.github.com/）后执行 gh auth login")
     else:
         print("  2) GitHub Actions 版：你仓库的 Settings → Secrets and variables → Actions，"
-             "新建 WB_ACCESS_TOKEN 并粘贴")
+             "新建 %s 并粘贴" % secret)
         print("     WPS 金山文档版：「签到自动化」表的 B1 单元格粘贴")
     print("\n----- 以下为 token -----")
     print(token)

@@ -9,6 +9,14 @@
   4. 猫猫失败不污染签到结论 —— 签到成功即整体成功。
 
 凭证来自 GitHub Secret（由本机 refresh_token.py 注入），只读环境变量，不落盘、不打日志。
+
+多账号：同一个仓库可托管多个 WorkBuddy 账号，由仓库变量 WB_ACCOUNTS 决定
+要跑几份，Actions 按账号矩阵并行执行，每个账号一份 token、一张卡片。
+本脚本只关心自己被分到的那一份：
+    WB_ACCESS_TOKEN    该账号的令牌（值为空即视为未配置，退出码 2）
+    WB_ACCOUNT         账号 id（如 MAIN / WORK），只用于日志与排错
+    WB_ACCOUNT_LABEL   账号显示名，进飞书卡片标题与 step summary
+    WB_TOKEN_SECRET    该账号对应的 Secret 名，仅用于缺失令牌时的提示文案
 """
 
 import json
@@ -312,7 +320,8 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
             "header": {
                 "template": color,
                 "title": {"tag": "plain_text",
-                          "content": "Buddy 加油站 · %s" % ("成功" if overall_ok else "部分失败")},
+                          "content": "Buddy 加油站 · %s · %s"
+                                     % (title, "成功" if overall_ok else "部分失败")},
             },
             "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}],
         },
@@ -332,13 +341,33 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
 
 # ---------------------------------------------------------------- 主流程
 
+def _token_hint(secret_name, account):
+    """令牌为空时，给出与 Secret 名对得上的本机命令。"""
+    suffix = ""
+    if secret_name.startswith("WB_ACCESS_TOKEN_") and len(secret_name) > len("WB_ACCESS_TOKEN_"):
+        suffix = " --account %s" % secret_name[len("WB_ACCESS_TOKEN_"):]
+    elif secret_name not in ("", "WB_ACCESS_TOKEN"):
+        # 自定义 Secret 名：脚本推不出映射关系，直接说明要去网页填
+        return "（该 Secret 名不是脚本默认规则，请在仓库 Settings → Secrets 里手工填入）"
+    return "（在本机运行：python refresh_token.py --gh-repo OWNER/REPO%s）" % suffix
+
+
 def main():
     token = os.environ.get("WB_ACCESS_TOKEN")
     webhook = os.environ.get("FEISHU_WEBHOOK")
     endpoint = os.environ.get("WB_ENDPOINT") or DEFAULT_ENDPOINT
+    account = (os.environ.get("WB_ACCOUNT") or "").strip()
+    label = (os.environ.get("WB_ACCOUNT_LABEL") or "").strip() or account
+    secret_name = (os.environ.get("WB_TOKEN_SECRET") or "").strip()
+
+    if label:
+        log("=== 账号：%s%s ===" % (label, "（%s）" % account if account and account != label else ""))
 
     if not token:
-        log("缺少环境变量 WB_ACCESS_TOKEN（请在本机运行 refresh_token.py 注入 GitHub Secret）")
+        detail = "缺少环境变量 WB_ACCESS_TOKEN"
+        if secret_name:
+            detail = "Secret %s 没有值" % secret_name
+        log(detail + _token_hint(secret_name, account))
         return 2
     if not webhook:
         log("缺少环境变量 FEISHU_WEBHOOK")
@@ -367,10 +396,12 @@ def main():
     checkin_line = ("✅ " if checkin_ok else "❌ ") + checkin["report"]
     buddy_line = ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论"
 
+    title = label or "每日自动化"
     if webhook:
-        push_feishu(webhook, "每日自动化", checkin_line, buddy_line, overall_ok)
+        push_feishu(webhook, title, checkin_line, buddy_line, overall_ok)
 
     result = {
+        "account": {"id": account, "label": label},
         "checkin": {"ok": checkin_ok, **checkin},
         "buddy": {k: v for k, v in buddy.items() if k != "notes"},
         "overall_ok": overall_ok,
@@ -382,6 +413,8 @@ def main():
     if result_file:
         try:
             with open(result_file, "w", encoding="utf-8") as f:
+                if label:
+                    f.write("**账号：%s**\n\n" % label)
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
                 f.write("| 签到 | %s |\n" % checkin_line)
                 f.write("| 猫猫旅行 | %s |\n" % buddy_line)
