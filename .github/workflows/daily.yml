@@ -74,7 +74,10 @@ jobs:
               # 默认取 WB_ACCESS_TOKEN_<ID>；MAIN 兼容单账号时期的旧名字
               if not secret:
                   secret = "WB_ACCESS_TOKEN" if aid == "MAIN" else "WB_ACCESS_TOKEN_" + aid
-              accounts.append({"id": aid, "label": label or aid, "secret": secret})
+              # webhook 名在这里算好，工作流里就只剩 secrets[matrix.webhook] 这种
+              # 纯属性访问，不必在索引表达式里套 format()
+              accounts.append({"id": aid, "label": label or aid,
+                               "secret": secret, "webhook": "FEISHU_WEBHOOK_" + aid})
 
           ids = [a["id"] for a in accounts]
           dup = sorted({x for x in ids if ids.count(x) > 1})
@@ -84,7 +87,9 @@ jobs:
           # 单行 JSON：GITHUB_OUTPUT 不支持多行值
           print("matrix=" + json.dumps(accounts, ensure_ascii=False, separators=(",", ":")))
           for a in accounts:
-              print("  · %s（%s）→ Secret %s" % (a["label"], a["id"], a["secret"]), file=sys.stderr)
+              print("  · %s（%s）→ 令牌 %s / 推送 %s"
+                    % (a["label"], a["id"], a["secret"], a["webhook"] + " 或 FEISHU_WEBHOOK"),
+                    file=sys.stderr)
           PY
 
   # ---------------------------------------------------------------- 逐账号执行
@@ -123,8 +128,8 @@ jobs:
         env:
           # 每个账号取自己那份 Secret；缺失时为空字符串，由脚本明确报错（exit 2）
           WB_ACCESS_TOKEN: ${{ secrets[matrix.secret] }}
-          # 账号专属 webhook 优先，没配就用全局的
-          FEISHU_WEBHOOK: ${{ secrets[format('FEISHU_WEBHOOK_{0}', matrix.id)] || secrets.FEISHU_WEBHOOK }}
+          # 账号专属 webhook 优先，没配就用全局的（未定义的 Secret 取值为空字符串，故用 || 兜底）
+          FEISHU_WEBHOOK: ${{ secrets[matrix.webhook] || secrets.FEISHU_WEBHOOK }}
           WB_ACCOUNT: ${{ matrix.id }}
           WB_ACCOUNT_LABEL: ${{ matrix.label }}
           WB_TOKEN_SECRET: ${{ matrix.secret }}
