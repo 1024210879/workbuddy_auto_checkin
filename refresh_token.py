@@ -550,7 +550,10 @@ def main():
         return EXIT_OK
 
     # ---- 去重：这枚令牌已经推送过就不再重复调用 GitHub（按 Secret 名分开记）----
-    if not opts["force"] and expires_at is not None:
+    # 只在真的会写入 Secret 时生效；纯打印模式（无 --gh-repo 或没有 gh）必须能把 token 打出来，
+    # 否则想手工复制一次都会被去重挡掉
+    will_push = bool(opts["gh_repo"]) and shutil.which("gh") is not None
+    if will_push and not opts["force"] and expires_at is not None:
         if pushed_expiry(secret) == expires_at:
             print("[跳过] 该令牌（%s 到期）此前已推送过 %s，无需重复写入" % (when, secret))
             return EXIT_OK
