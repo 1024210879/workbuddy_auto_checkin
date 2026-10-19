@@ -14,18 +14,19 @@
     python refresh_token.py --gh-repo OWNER/REPO --account WORK
     写入 WB_ACCESS_TOKEN_WORK。不带 --account 时仍写 WB_ACCESS_TOKEN（单账号 / 主号）。
 
-自动续期（配合开机计划任务，见 scripts/setup_task.ps1）：
+自动续期（配合定时计划任务，见 scripts/setup_task.ps1）：
     python refresh_token.py --gh-repo OWNER/REPO --log 日志路径
-    每次开机跑一遍即可：客户端启动时已自动刷新凭据，本脚本只负责同步到 Secret。
+    客户端每次启动都会轮换 accessToken（旧令牌立即失效），所以本脚本要定期跑：
+    发现本机令牌比 Secret 里的更新就重推，没变化就静默退出（不调用 GitHub）。
 
     可选参数：
       --account ID   把令牌写入 WB_ACCESS_TOKEN_ID（多账号时用来区分）。
                      只允许 A-Z 0-9 _，会统一转成大写。
-      --min-days N   令牌剩余不足 N 天时不推送（默认 3）。防止把将过期/已过期的
-                     token 写进 Secret，覆盖掉里面还有效的那一枚。
+      --min-days N   仅在没有历史推送记录时生效：令牌剩余不足 N 天就拒绝推送
+                     （默认 3）。有记录时按「谁更新用谁」比较，不看剩余天数。
       --wait SEC     登录后客户端可能尚未刷新完，最多等待 SEC 秒轮询凭据变化。
       --check        只检查新鲜度，不做任何写入。
-      --force        忽略新鲜度与去重，强制推送。
+      --force        忽略新鲜度判断，强制推送。
       --log PATH     输出追加到日志文件（供静默运行使用，日志中绝不含 token）。
 
     退出码：0 成功/无需推送；3 令牌不新鲜已跳过；4 令牌已过期；1 其他错误。
@@ -35,11 +36,12 @@
 安全约定：
   - 明文 token 只出现在本进程内存与最终那一次目标位置；
   - 命令行参数、环境变量、日志均不含明文 token；
-  - 不写临时 token 文件（状态文件只记录「已推送的过期时间戳」，不含 token）。
+  - 不写临时 token 文件（状态文件只记录过期时间戳与 12 位指纹，不含 token）。
 """
 
 import base64
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -432,6 +434,16 @@ def dig_session(obj, *keys):
     return obj
 
 
+def fmt_time(ts):
+    """把秒级时间戳格式化成人看的时间；非法值返回空串。"""
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return ""
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
 def read_state():
     try:
         with open(os.path.join(_data_dir(), "state.json"), "r", encoding="utf-8") as f:
@@ -462,14 +474,17 @@ def pushed_expiry(secret):
     return None
 
 
-def write_state(secret, expires_at):
-    """只记录「已推送令牌的过期时刻」，不含任何凭据内容。"""
+def write_state(secret, expires_at, fingerprint=""):
+    """只记录「已推送令牌的过期时刻 + 指纹」，不含任何凭据内容。"""
     state = read_state()
     pushed = state.get("pushed")
     if not isinstance(pushed, dict):
         pushed = {}
-    pushed[secret] = {"expires_at": expires_at,
-                      "pushed_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    entry = {"expires_at": expires_at,
+             "pushed_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    if fingerprint:
+        entry["fp"] = fingerprint
+    pushed[secret] = entry
     state["pushed"] = pushed
     state.pop("pushed_expires_at", None)     # 旧格式字段，迁移后不再需要
     state.pop("pushed_at", None)
@@ -520,12 +535,14 @@ def main():
         session = wait_for_refresh(auth_file, session, opts["wait"])
 
     # ---- 新鲜度闸门：宁可不写，也不能把坏令牌覆盖进 Secret ----
+    # 关键背景：客户端每次启动都会轮换 accessToken，旧令牌立即失效。
+    # 所以判断依据不是「还剩几天」，而是「本机这枚是否比 Secret 里的更新」。
     expires_at = token_expiry(session)
-    when = ""
+    recorded = pushed_expiry(secret)
+    when = fmt_time(expires_at)
     if expires_at is None:
         print("[检查] 凭据未提供过期时间，无法判断新鲜度，按原样继续")
     else:
-        when = datetime.datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
         left = expires_at - time.time()
         if left <= 0:
             print("[过期] 令牌已于 %s 过期（本机超过约 28 天未启动 WorkBuddy 会如此）" % when)
@@ -534,29 +551,35 @@ def main():
                 print("       处理：启动 WorkBuddy 客户端（它会自动刷新凭据），再运行本脚本。")
                 return EXIT_EXPIRED
             print("       已指定 --force，仍然继续")
+        elif recorded is not None and expires_at > recorded + 1:
+            print("[更新] 客户端已轮换令牌：本机 %s 到期，Secret 里是 %s 到期"
+                  % (when, fmt_time(recorded)))
+            print("       旧令牌在轮换后立即失效，必须重推，否则 Actions 一定 401。")
+        elif recorded is not None:
+            if not opts["force"]:
+                print("[跳过] 本机令牌 %s 到期，不比 Secret 里的（%s）更新，无需重复写入"
+                      % (when, fmt_time(recorded)))
+                return EXIT_OK
+            print("       已指定 --force，仍然继续（本机令牌并不比 Secret 里新）")
         elif left < opts["min_days"] * 86400:
+            # 没有推送记录时无法比较新旧，只能保守一点：快过期的不要覆盖上去
             print("[不新鲜] 令牌剩余 %.1f 天（%s 到期），低于阈值 %.0f 天"
                   % (left / 86400.0, when, opts["min_days"]))
             if not opts["force"]:
-                print("       本次不写入 Secret，保留 Secret 里可能更新的那一枚。")
+                print("       本次不写入 Secret（没有历史推送记录，不敢确定谁更新）。")
                 print("       启动 WorkBuddy 客户端即可自动续期，之后本脚本会重试。")
                 return EXIT_STALE
             print("       已指定 --force，仍然继续")
         else:
-            print("[检查] 令牌剩余 %.1f 天（%s 到期）" % (left / 86400.0, when))
+            print("[检查] 令牌剩余 %.1f 天（%s 到期），首次推送" % (left / 86400.0, when))
 
     if opts["check"]:
         print("[检查] --check 模式，不做任何写入")
         return EXIT_OK
 
-    # ---- 去重：这枚令牌已经推送过就不再重复调用 GitHub（按 Secret 名分开记）----
-    # 只在真的会写入 Secret 时生效；纯打印模式（无 --gh-repo 或没有 gh）必须能把 token 打出来，
-    # 否则想手工复制一次都会被去重挡掉
+    # 纯打印模式（无 --gh-repo 或没有 gh）必须能把 token 打出来，
+    # 否则想手工复制一次都会被判断逻辑挡掉
     will_push = bool(opts["gh_repo"]) and shutil.which("gh") is not None
-    if will_push and not opts["force"] and expires_at is not None:
-        if pushed_expiry(secret) == expires_at:
-            print("[跳过] 该令牌（%s 到期）此前已推送过 %s，无需重复写入" % (when, secret))
-            return EXIT_OK
 
     token = dig_session(session, "auth", "accessToken")
     if not token:
@@ -569,6 +592,8 @@ def main():
     if not (isinstance(token, str) and TOKEN_RE.fullmatch(token)):
         raise SystemExit("token 格式异常")
 
+    fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
     # 有 gh 且指定了仓库 → 自动写入；否则统一走「指引 + 起止标记 + token」，
     # 保证无论是终端跑 .py 还是双击 exe，输出结构一致、都能照着做
     if opts["gh_repo"] and shutil.which("gh") is not None:
@@ -580,8 +605,8 @@ def main():
         )
         if proc.returncode != 0:
             raise SystemExit("写入 GitHub Secret 失败：" + proc.stderr.decode("utf-8", "replace"))
-        write_state(secret, expires_at)
-        print("已写入 GitHub Secret %s（仓库 %s）" % (secret, opts["gh_repo"]))
+        write_state(secret, expires_at, fingerprint)
+        print("已写入 GitHub Secret %s（仓库 %s，令牌指纹 %s）" % (secret, opts["gh_repo"], fingerprint))
         return EXIT_OK
 
     if opts["gh_repo"]:

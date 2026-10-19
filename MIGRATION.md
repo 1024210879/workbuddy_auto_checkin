@@ -141,13 +141,17 @@ gh secret set FEISHU_WEBHOOK --repo <新账号>/workbuddy_auto_checkin --body "h
 powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo <新账号>/workbuddy_auto_checkin -RunNow
 ```
 
-行为：优先注册计划任务（登录后 2 分钟 + 每天 12:00）；**权限不足时自动降级**为写入
-「启动」文件夹的 vbs（登录时触发，无需管理员）。`-RunNow` 会立刻跑一次并回显日志尾部。
+行为：优先注册计划任务（登录后 1 分钟 + **每 5 分钟**重复，`-IntervalMinutes` 可调）；**权限不足时自动降级**为写入
+「启动」文件夹的 vbs，它启动的 `.cmd` 自己循环，效果等价。`-RunNow` 会立刻跑一次并回显日志尾部。
 
-**风险点：路径含中文。** `setup_task.ps1` 生成的 `.cmd` 用 ASCII 写入，
-如果新机器的项目路径或用户名带中文（如 `C:\Users\张三\...`），路径会被写成 `?` 导致启动失败。
-检测方式：看 `scripts\run_refresh.cmd` 里路径是否正常显示。若含中文，把项目放到纯英文路径
-（如 `C:\Tools\workbuddy_auto_checkin`）再重跑脚本。
+> **为什么要每 5 分钟一次**：WorkBuddy 客户端每次启动都会轮换 `accessToken`，旧令牌立即作废。
+> 只在开机时同步一次，之后重启客户端，Secret 里就是废令牌 → 次日 Actions 稳定 `401`。
+> 脚本会先比对本机令牌与已推送令牌，没变化就直接退出，不会频繁调用 GitHub。
+
+**中文路径：已处理。** 生成的 `.cmd` 只用 `%~dp0`（脚本自身位置）和 `%LOCALAPPDATA%`，
+由 cmd 运行时展开，项目路径和用户名带中文都不会变成 `?`；`.vbs` 在路径非 ASCII 时自动改用
+UTF-16LE 写入（WSH 支持带 BOM 的 Unicode 脚本）。旧版脚本曾把完整路径按 ASCII 写进 `.cmd`，
+如果你在新机器上用的是旧脚本，重新跑一次本脚本即可覆盖。
 
 ---
 
@@ -187,8 +191,8 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo <新账号
 | 现象 | 先看 | 常见原因 |
 | --- | --- | --- |
 | Actions 完全不跑 | 仓库 Actions 是否启用 | fork 后没点启用 |
-| 跑了但 401 | Secret 时间戳 | 新机 `--check` 没过就写了，或闸门被 `--force` 绕过 |
+| 跑了但 401 | Secret 时间戳与 `state.json` 的 `expires_at` | **客户端重启过、令牌已轮换**（最常见）；或新机 `--check` 没过就写了 |
 | 本机脚本报找不到凭据 | 客户端是否登录过 | 新机还没启动客户端 / 换了账号没登录 |
 | 客户端定位失败 | `WORKBUDDY_EXE` 环境变量 | 装在非标准目录，注册表也没记录 |
 | 解密报错 | 客户端版本 | 私有 binding 与版本绑定，升级客户端后重测 `--check` |
-| 开机没自动跑 | `%APPDATA%\...\Startup` 下有没有 vbs | 降级失败 / 被安全软件清理 |
+| 开机没自动跑 | `%APPDATA%\...\Startup` 下有没有 vbs | 降级失败 / 被安全软件清理 / 上次 `-Uninstall` 留了 `refresh.stop` |
