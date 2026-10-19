@@ -152,6 +152,72 @@ python refresh_token.py
 
 > 这个页面显示绿色不代表签到一定成功（猫猫出问题不影响整体结论）。**以飞书收到的消息为准。**
 
+## 令牌自动续期（可选）
+
+token 有效期 28 天。手动重跑一次脚本能用一个月，但很容易忘。做成本机计划任务后就不用再管。
+
+### 原理：刷新工作交给客户端，脚本只负责搬运
+
+桌面端每次启动都会自己刷新一次令牌并写回凭据文件——所以 `lastRefreshTime` 与凭据文件的修改时间总是同一时刻，`refreshExpiresAt` 也随之顺延 30 天。这意味着：
+
+> **只要这台电脑每 30 天内启动过一次 WorkBuddy，凭据文件里的令牌就永远是新鲜的。**
+
+脚本不需要（也不应该）自己去调刷新接口，它只需把文件里那枚已经新鲜的令牌搬到 GitHub Secret。
+
+### 三步配好
+
+前提：装好 `gh` 并完成一次登录（只有它能写 Secret，且不需要把 token 复制来复制去）。
+
+```
+winget install --id GitHub.cli
+gh auth login
+```
+
+然后在项目目录执行：
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用户名/workbuddy_auto_checkin
+```
+
+加 `-RunNow` 可当场试跑并回显日志。
+
+脚本会先尝试注册计划任务 `WorkBuddyTokenRefresh`，两个触发点：
+
+- **登录后 2 分钟** — 等客户端把凭据刷新完再读，这是主路径
+- **每天 12:00** — 兜底，兼顾长期不重启的台式机
+
+**如果注册被拒绝**（普通账户未提升权限时会这样），脚本会自动降级为「启动」文件夹方式，不需要任何管理员权限：
+
+- 生成 `scripts\run_refresh.cmd` 与 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\WorkBuddyTokenRefresh.vbs`
+- 效果等价，只是没有「每天 12:00」的兜底——每天登录一次就够
+- 想要兜底触发，用管理员身份打开 PowerShell 重跑一次本脚本即可
+
+移除（两种方式都会一并清理）：`powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Uninstall`
+
+### 为什么要带「新鲜度闸门」
+
+这是自动刷新最容易踩的坑：**如果本机超过 28 天没开机，凭据文件里躺着的是已过期的令牌**。此时若无脑写入 Secret，会把里面原本还能用的那枚覆盖掉，定时任务立刻全线 401——比不刷新更糟。
+
+所以脚本在写入前会检查凭据里的 `expiresAt`：
+
+| 情况 | 行为 | 退出码 |
+| --- | --- | --- |
+| 剩余 ≥ `--min-days`（默认 3 天） | 正常写入 Secret | 0 |
+| 剩余 < 3 天 | **跳过，不动 Secret** | 3 |
+| 已经过期 | **跳过，不动 Secret**，提示先启动客户端 | 4 |
+| 该令牌已推送过（比对本地记录） | 跳过，省一次 API 调用 | 0 |
+
+本地只在 `%LOCALAPPDATA%\workbuddy_auto_checkin\state.json` 记一个「已推送令牌的过期时刻」，不含任何凭据。日志里也不会出现明文 token。
+
+所以最坏的情况是：你出差一个月回来，任务跳过了一次，Secret 里仍是你离开前那枚——重新打开 WorkBuddy（客户端自动续期）后，下一轮触发就会把新令牌同步上去，无需手工操作。
+
+> `setup_task.ps1` 通过 `pythonw`/`pyw` 静默运行，不会弹黑窗口；日志在 `%LOCALAPPDATA%\workbuddy_auto_checkin\refresh.log`。
+> 仓库里的 `refresh_token.exe` 是在本次改动之前打包的，不含闸门逻辑；如果你用 exe 手动刷新，建议改用 `python refresh_token.py`（或重新打包）。
+
+### 不想装 gh 的替代做法
+
+如果连 `gh` 都不想装，可以让整条链路都留在本机：用计划任务每天直接跑 `wb_auto.py`（把 `WB_ACCESS_TOKEN` 与 `FEISHU_WEBHOOK` 放进用户环境变量），每次现取现用，彻底不存在令牌过期的问题——代价是这台电脑得开机联网，失去「云端照常执行」这个优势。
+
 ## 配置项
 
 ### Actions 侧（`wb_auto.py`）
@@ -164,6 +230,19 @@ python refresh_token.py
 | `WB_RESULT_FILE` | 否 | — | 写入 Markdown 汇总表，供 Actions 的 step summary 使用 |
 
 ### 本机侧（`refresh_token.py`）
+
+| 参数 | 说明 |
+| --- | --- |
+| `--gh-repo OWNER/REPO` | 直接写入仓库 Secret（需要 gh CLI） |
+| `--min-days N` | 令牌剩余不足 N 天就不推送（默认 3），避免写入将过期的令牌 |
+| `--wait SEC` | 登录后客户端尚未刷新完时，最多轮询等待这么多秒 |
+| `--check` | 只检查令牌新鲜度，不做任何写入 |
+| `--force` | 忽略新鲜度与去重，强制推送 |
+| `--log PATH` | 输出追加到日志文件（静默运行用，日志中不含 token） |
+
+退出码：`0` 成功或无需推送 / `3` 令牌不新鲜已跳过 / `4` 令牌已过期 / `1` 其他错误。
+
+### 环境变量（`refresh_token.py`）
 
 | 变量 | 说明 |
 | --- | --- |
@@ -223,6 +302,7 @@ POST /v2/activity/growth/buddy/travel/depart     派出一趟
 wb_auto.py                    云端执行主体：签到、领奖、派出、推送
 refresh_token.py              本机一次性操作：导出 token / 写入 Secret
 refresh_token.exe             上者的免 Python 打包版（Windows x64，双击即用）
+scripts/setup_task.ps1        注册登录时自动同步令牌（权限不足时降级为启动文件夹）
 .github/workflows/daily.yml   cron 定义与执行步骤
 wps/                          WPS 金山文档版（脚本 + 说明，见 wps/README.md）
 ```
@@ -240,7 +320,10 @@ wps/                          WPS 金山文档版（脚本 + 说明，见 wps/RE
 
 ## 常见问题
 
-**令牌过期** — token 由客户端签发，有效期约 28 天（`expiresIn` 2419200）。日志或飞书出现「认证被拒」时，本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；exe 同理：`refresh_token.exe --gh-repo OWNER/REPO`）。
+**令牌过期** — token 由客户端签发，有效期 28 天（`expiresIn` 2419200）。两种处理：
+
+- 一次性：本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；exe 同理）。
+- 一劳永逸：按「令牌自动续期」配好计划任务，之后无需再管。注意配好后 `refresh_token.py` 只在令牌剩余 ≥ 3 天时才写入 Secret，所以日志里出现「不新鲜/已过期，已跳过」是**正常保护行为**，不是故障——启动一次 WorkBuddy 就会恢复。
 
 **fork 之后 Actions 页签是空的** — fork 来的仓库默认不启用 Actions。进 Actions 页签，点页面中间的 **I understand my workflows, go ahead and enable them** 启用一次即可。
 

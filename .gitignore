@@ -9,3 +9,8 @@ token*.jpg
 build/
 dist/
 *.spec
+# 由 setup_task.ps1 生成，内含本机绝对路径
+scripts/run_refresh.cmd
+scripts/WorkBuddyTokenRefresh.vbs
+# 本机工作记录与计划，含本机绝对路径和账号信息
+.workbuddy/
