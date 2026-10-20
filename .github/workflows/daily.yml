@@ -1,5 +1,9 @@
 name: Buddy 加油站每日自动化
 
+# 注意：本文件是仓库唯一的 workflow。下方 3 条 cron 是同一 workflow 的 3 个
+# 触发时刻（互为备份），不是 3 个 workflow；每次触发产生一次 run，
+# run 内含 prepare + 每账号一个「签到」job（账号数由仓库变量 WB_ACCOUNTS 决定）。
+
 on:
   schedule:
     # GitHub 的 cron 是尽力而为：高负载时会延迟，甚至静默丢弃整次运行。
