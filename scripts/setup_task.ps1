@@ -229,15 +229,22 @@ if ($Uninstall) {
         $removed = $true
     }
     if (-not $removed) { Write-Host "[--] 没找到已注册的计划任务或启动项：$TaskName" }
-    # 桌面快捷方式与它的 .cmd 一起清掉
-    $lnkName = "同步 WorkBuddy 令牌" + $(if ($Account) { "（" + $Account + "）" } else { "" }) + ".lnk"
-    $lnkPath = Join-Path ([Environment]::GetFolderPath("Desktop")) $lnkName
-    if (Test-Path -LiteralPath $lnkPath) {
-        Remove-Item -LiteralPath $lnkPath -Force
-        Write-Host "[OK] 已移除桌面快捷方式：$lnkPath" -ForegroundColor Green
+    # 桌面快捷方式与它的 .cmd：新版是通用的「同步 WorkBuddy 令牌」，
+    # 旧版按账号后缀命名。本机若还有别的账号在用，通用那份要留着。
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    $stillUsed = @(Get-ChildItem -LiteralPath $startupDir -Filter "WorkBuddyTokenRefresh-*.vbs" -ErrorAction SilentlyContinue).Count -gt 0
+    $targets = @(Join-Path $desktop ("同步 WorkBuddy 令牌" + $(if ($Account) { "（" + $Account + "）" } else { "" }) + ".lnk"))
+    if (-not $stillUsed) {
+        $targets += (Join-Path $desktop "同步 WorkBuddy 令牌.lnk")
+        $targets += (Join-Path $scriptDir "sync_now.cmd")
     }
-    $syncCmd = Join-Path $scriptDir ("sync_now" + $suffix + ".cmd")
-    if (Test-Path -LiteralPath $syncCmd) { Remove-Item -LiteralPath $syncCmd -Force }
+    $targets += (Join-Path $scriptDir ("sync_now" + $suffix + ".cmd"))
+    foreach ($t in $targets) {
+        if (Test-Path -LiteralPath $t) {
+            Remove-Item -LiteralPath $t -Force
+            Write-Host "[OK] 已移除：$t" -ForegroundColor Green
+        }
+    }
     # 多账号时其它账号各自的启动项不会被这条命令带走，提示一下免得以为清干净了
     $others = @()
     foreach ($f in (Get-ChildItem -LiteralPath $startupDir -Filter "WorkBuddyTokenRefresh-*.vbs" -ErrorAction SilentlyContinue)) {
@@ -407,8 +414,15 @@ try {
 # 场景：登录脚本只在开机时跑一次；你中途关掉再打开 WorkBuddy，客户端会轮换
 # 令牌，这一枚才是有效的。点一下这个快捷方式就能把新令牌推上去。
 if (-not $NoShortcut) {
-    $syncCmd = Join-Path $scriptDir ("sync_now" + $suffix + ".cmd")
-    # 用控制台版 python：双击后能看到「已写入 / 跳过」的结论，不是黑窗一闪而过
+    # 通用入口：不带账号，运行时由 refresh_token.py --ask-account 问你。
+    # 这样 .cmd 里不会写死某台机器的 id，换账号也不用重新生成。
+    $syncCmd = Join-Path $scriptDir "sync_now.cmd"
+    # 旧版按账号后缀生成的 .cmd 一并清掉，免得两套入口并存
+    foreach ($stale in (Get-ChildItem -LiteralPath $scriptDir -Filter "sync_now-*.cmd" -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $stale.FullName -Force
+        Write-Host "[--] 已清理旧脚本：$($stale.Name)"
+    }
+    # 用控制台版 python：双击后能看到提问与「已写入 / 跳过」的结论，不是黑窗一闪而过
     $console = $null
     foreach ($n in @("py", "python")) {
         if (Get-Command $n -ErrorAction SilentlyContinue) { $console = $n; break }
@@ -420,29 +434,31 @@ if (-not $NoShortcut) {
             'setlocal'
             'title WorkBuddy token sync'
             '"' + $console + '" ' + $consolePrefix + '"%~dp0..\refresh_token.py" --gh-repo ' + $Repo +
-                $(if ($Account) { ' --account ' + $Account } else { '' }) +
-                ' --wait 60 --log "' + '%LOCALAPPDATA%\workbuddy_auto_checkin\sync' + $suffix + '.log"'
+                ' --ask-account --wait 60 --log "' + '%LOCALAPPDATA%\workbuddy_auto_checkin\sync.log"'
             'echo.'
-            'echo ---- done. log: %LOCALAPPDATA%\workbuddy_auto_checkin\sync' + $suffix + '.log'
+            'echo ---- done. log: %LOCALAPPDATA%\workbuddy_auto_checkin\sync.log'
             'ping -n 9 127.0.0.1 >nul'
         )
         [IO.File]::WriteAllText($syncCmd, (($syncLines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
 
         $desktop = [Environment]::GetFolderPath("Desktop")
-        $lnkName = "同步 WorkBuddy 令牌" + $(if ($Account) { "（" + $Account + "）" } else { "" }) + ".lnk"
-        $lnkPath = Join-Path $desktop $lnkName
+        $lnkPath = Join-Path $desktop "同步 WorkBuddy 令牌.lnk"
+        # 旧版「同步 WorkBuddy 令牌（ID）.lnk」清掉，只留一个通用入口
+        foreach ($stale in (Get-ChildItem -LiteralPath $desktop -Filter "同步 WorkBuddy 令牌（*.lnk" -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $stale.FullName -Force
+        }
         try {
             $wsh = New-Object -ComObject WScript.Shell
             $lnk = $wsh.CreateShortcut($lnkPath)
             $lnk.TargetPath = $env:COMSPEC
             $lnk.Arguments = '/c ""' + $syncCmd + '""'
             $lnk.WorkingDirectory = $root
-            $lnk.Description = "打开 WorkBuddy 之后点一下：把新令牌同步到 GitHub Secret " + $secretName
+            $lnk.Description = "打开 WorkBuddy 之后点一下：按提示选择账号，把新令牌同步到 GitHub Secret"
             $wb = Get-Process -Name WorkBuddy -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($wb -and $wb.Path) { $lnk.IconLocation = $wb.Path + ",0" }
             $lnk.Save()
             Write-Host "`n[OK] 桌面快捷方式：$lnkPath" -ForegroundColor Green
-            Write-Host "     手动打开 / 重启 WorkBuddy 后双击它即可（约 3 秒）"
+            Write-Host "     双击后会先问「本机账号 id」（回车沿用上次），随后自动同步" -ForegroundColor DarkGray
         } catch {
             Write-Host ("`n[!] 创建快捷方式失败：{0}" -f $_.Exception.Message) -ForegroundColor Yellow
             Write-Host "     可以直接双击：$syncCmd"

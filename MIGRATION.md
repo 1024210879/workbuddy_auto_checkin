@@ -150,8 +150,10 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1
 并在桌面生成「同步 WorkBuddy 令牌」快捷方式。`-RunNow` 会立刻跑一次并回显日志尾部。
 
 > **注意**：WorkBuddy 客户端每次启动都会轮换 `accessToken`，旧令牌立即作废。
-> 登录那次只覆盖开机场景；**中途关掉又打开客户端后，点一下桌面快捷方式**即可（约 3 秒）。
-> 快捷方式内部是 `refresh_token.py --wait 60`：凭据文件刚被写过才等待，否则秒退。
+> 登录那次只覆盖开机场景；**中途关掉又打开客户端后，点一下桌面快捷方式**即可。
+> 快捷方式调用 `scripts\sync_now.cmd`，里面**不写死账号**：双击后先问「本机账号 id」
+> （回车沿用上次，输入 `-` 表示单账号模式），再跑 `refresh_token.py --ask-account --wait 60`；
+> 没有控制台时不会提问，直接用上次的值。换账号 / 多账号共用一台机器时都不必重新生成。
 
 > 新机器上如果路径/用户名含中文也没关系：`.cmd` 只用 `%~dp0` 与 `%LOCALAPPDATA%` 运行时展开。
 

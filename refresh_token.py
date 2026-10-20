@@ -14,14 +14,17 @@
     python refresh_token.py --gh-repo OWNER/REPO --account WORK
     写入 WB_ACCESS_TOKEN_WORK。不带 --account 时仍写 WB_ACCESS_TOKEN（单账号 / 主号）。
 
-手动同步（打开 WorkBuddy 之后跑一次，见 scripts/open_and_sync.cmd）：
-    python refresh_token.py --gh-repo OWNER/REPO --account ID --wait 60
+手动同步（打开 WorkBuddy 之后跑一次，见桌面「同步 WorkBuddy 令牌」快捷方式）：
+    python refresh_token.py --gh-repo OWNER/REPO --ask-account --wait 60
     客户端每次启动都会轮换 accessToken、旧令牌立即失效，所以「手动打开客户端」
     之后必须重跑一次本脚本；--wait 会让它在客户端还没写完凭据时多等一会儿。
+    --ask-account 会当场问你要同步哪个账号（回车沿用上次用的），
+    省得把某台机器的 id 写死在 .cmd 里。
 
     可选参数：
       --account ID   把令牌写入 WB_ACCESS_TOKEN_ID（多账号时用来区分）。
                      只允许 A-Z 0-9 _，会统一转成大写。
+      --ask-account  没有 --account 时交互式询问账号 id（无控制台则用上次的值）。
       --min-days N   仅在没有历史推送记录时生效：令牌剩余不足 N 天就拒绝推送
                      （默认 3）。有记录时按「谁更新用谁」比较，不看剩余天数。
       --wait SEC     打开客户端后立刻运行时，最多等 SEC 秒直到凭据换新。
@@ -383,7 +386,8 @@ def install_log(path):
 
 def parse_args(argv):
     opts = {"gh_repo": None, "min_days": DEFAULT_MIN_DAYS, "check": False,
-            "force": False, "log": None, "wait": 0.0, "account": ""}
+            "force": False, "log": None, "wait": 0.0, "account": "",
+            "ask_account": False}
     numeric = {"--min-days": "min_days", "--wait": "wait"}
     i = 0
     while i < len(argv):
@@ -412,8 +416,11 @@ def parse_args(argv):
             opts["check"] = True
         elif arg == "--force":
             opts["force"] = True
+        elif arg == "--ask-account":
+            opts["ask_account"] = True
         else:
-            raise SystemExit("未知参数：%s（可用：--gh-repo --account --min-days --wait --check --force --log）" % arg)
+            raise SystemExit(
+                "未知参数：%s（可用：--gh-repo --account --ask-account --min-days --wait --check --force --log）" % arg)
         i += 1
     return opts
 
@@ -473,6 +480,81 @@ def pushed_expiry(secret):
     if secret == DEFAULT_SECRET and isinstance(legacy, (int, float)) and not isinstance(legacy, bool):
         return float(legacy)
     return None
+
+
+def known_accounts():
+    """本机已同步过的账号 id（从 state.json 的 Secret 名反推）。"""
+    pushed = read_state().get("pushed")
+    found = set()
+    if isinstance(pushed, dict):
+        for name in pushed:
+            if name == DEFAULT_SECRET:
+                continue
+            if name.startswith(DEFAULT_SECRET + "_"):
+                found.add(name[len(DEFAULT_SECRET) + 1:])
+    return sorted(found)
+
+
+def ask_account():
+    """交互式询问本机账号 id（供桌面「同步 WorkBuddy 令牌」快捷方式使用）。
+
+    回车沿用上次用的账号；输入 - 或直接回车且无历史 = 单账号模式。
+    没有控制台（pythonw 静默运行 / stdin 被重定向）时不做提问，返回上次的值。
+    """
+    state = read_state()
+    last = state.get("last_account")
+    last = last.strip().upper() if isinstance(last, str) and ACCOUNT_RE.fullmatch(last.strip().upper()) else ""
+    known = known_accounts()
+    default = last or (known[0] if len(known) == 1 else "")
+
+    print("账号 id 决定写哪个 Secret：WB_ACCESS_TOKEN_<ID>；留空 = 单账号模式（WB_ACCESS_TOKEN）")
+    if known:
+        print("本机同步过的账号：%s" % "、".join(known))
+    elif not default:
+        print("本机还没有同步记录，可以填仓库变量 WB_ACCOUNTS 里给这台机器用的那个 id")
+
+    # 没有真正的控制台（计划任务 / 重定向 / pythonw）就别提问：否则会死等输入
+    if not (getattr(sys.stdin, "isatty", None) and sys.stdin.isatty()):
+        print("[提示] 当前没有可交互的控制台，按默认账号继续：%s" % (default or "单账号模式"))
+        return default
+
+    while True:
+        if default:
+            tip = "本机账号 id [回车沿用 %s，输入 - 表示单账号模式]：" % default
+        else:
+            tip = "本机账号 id [回车 = 单账号模式]："
+        try:
+            raw = input(tip)
+        except (EOFError, OSError, RuntimeError):
+            print("")
+            print("[提示] 没有可用的控制台输入，按默认值继续：%s" % (default or "单账号模式"))
+            return default
+        raw = (raw or "").strip()
+        if raw in ("-", "/", "0"):
+            return ""
+        if not raw:
+            return default
+        candidate = raw.upper()
+        if ACCOUNT_RE.fullmatch(candidate):
+            return candidate
+        print("  只能用字母、数字、下划线，1~32 位，请重新输入。")
+
+
+def remember_account(account):
+    """记下本次用的账号，下次提问时作为默认值（只存 id，不存令牌）。"""
+    state = read_state()
+    if state.get("last_account") == account:
+        return
+    if account:
+        state["last_account"] = account
+    else:
+        state.pop("last_account", None)
+    try:
+        os.makedirs(_data_dir(), exist_ok=True)
+        with open(os.path.join(_data_dir(), "state.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
 
 
 def write_state(secret, expires_at, fingerprint=""):
@@ -536,6 +618,10 @@ def wait_for_refresh(path, session, seconds, secret):
 
 def main():
     opts = parse_args(sys.argv[1:])
+    if opts["ask_account"] and not opts["account"]:
+        opts["account"] = ask_account()
+    if opts["account"]:
+        remember_account(opts["account"])
     secret = secret_name(opts["account"])
     log_path, _ = install_log(opts["log"])
     if log_path:

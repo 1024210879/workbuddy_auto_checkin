@@ -262,6 +262,10 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 1. **登录后 1 分钟自动跑一次同步**（计划任务 `WorkBuddyTokenRefresh`；权限不足时降级为「启动」文件夹，效果一样）
 2. **在桌面生成「同步 WorkBuddy 令牌」快捷方式** —— 中途手动打开 / 重启客户端后，点它一下即可
 
+快捷方式是**通用**的：脚本 `scripts\sync_now.cmd` 里不带账号，双击后先问你
+`本机账号 id`（回车沿用上次用过的，输入 `-` 表示单账号模式），再自动同步。
+所以同一台机器上有多个账号时也只有一个图标，`.cmd` 里不会写死某台机器的 id。
+
 整个过程不起常驻进程，用完就退。
 
 **如果注册被拒绝**（普通账户未提升权限时会这样），脚本会自动降级为「启动」文件夹方式，不需要任何管理员权限：
@@ -289,11 +293,12 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 | 场景 | 要做的事 |
 | --- | --- |
 | 开机登录（客户端随后自己启动） | 不用管，登录后 1 分钟自动同步 |
-| 中途关掉客户端又重新打开 | 点一下桌面「同步 WorkBuddy 令牌」，约 3 秒 |
+| 中途关掉客户端又重新打开 | 点一下桌面「同步 WorkBuddy 令牌」，按提示答账号 id（回车沿用上次），随后自动同步 |
 | 换机器 / 换账号 | 在新机器上跑一次 `setup_task.ps1`，按提示输入账号 id |
 
-快捷方式执行的是 `refresh_token.py --wait 60`，它很聪明地决定要不要等：
+快捷方式执行的是 `refresh_token.py --ask-account --wait 60`：
 
+- 有控制台才提问；没控制台（被计划任务/管道调用）直接用上次的账号，不会卡住
 - 凭据文件**最近两分钟内被写过**（说明客户端刚启动、可能还在刷新）→ 最多等 60 秒，一看到新令牌就立刻推送；
 - 否则立刻判断，没变化就直接退出，不到 1 秒，不会让你干等。
 
@@ -343,6 +348,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 | --- | --- |
 | `--gh-repo OWNER/REPO` | 直接写入仓库 Secret（需要 gh CLI） |
 | `--account ID` | 多账号：写入 `WB_ACCESS_TOKEN_<ID>`（id 自动转大写）。不带则写 `WB_ACCESS_TOKEN` |
+| `--ask-account` | 没有 `--account` 时当场问你账号 id（回车沿用上次，输入 `-` = 单账号模式）。无控制台则不提问，直接用上次的值——桌面快捷方式用的就是它 |
 | `--min-days N` | 仅在没有推送记录时生效：剩余不足 N 天就拒绝推送（默认 3）。有记录时按「谁更新用谁」比较 |
 | `--wait SEC` | 打开客户端后立刻运行时用：凭据刚被写过就最多等 SEC 秒，等到新令牌立即推送 |
 | `--check` | 只检查令牌新鲜度，不做任何写入 |
