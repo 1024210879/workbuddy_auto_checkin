@@ -1005,10 +1005,14 @@ def main():
     # 有 gh 且指定了仓库 → 自动写入；否则统一走「指引 + 起止标记 + token」，
     # 保证无论是终端跑 .py 还是双击 exe，输出结构一致、都能照着做
     if opts["gh_repo"] and shutil.which("gh") is not None:
-        # 明文 token 只作为 stdin 传给 gh，不出现在命令行与进程列表中
+        # token 经 argv 直传（--body <token>）。实测结论（2026-10-20 排查 401）：
+        #   --body -（stdin 管道）与 --body <临时文件> 在 Windows 下写进 Secret 的值
+        #   都会损坏（Actions 端 401，网关返回 HTML；同一枚 token 本机直连 200）；
+        #   只有 argv 直传能让 run 恢复 200。
+        # 代价：明文 token 短暂出现在本机进程列表——本脚本本就是单人单机的本机工具，
+        # 威胁模型可接受；换来的是「推上去的值一定可用」这个更强的保证。
         proc = subprocess.run(
-            ["gh", "secret", "set", secret, "--repo", opts["gh_repo"], "--body", "-"],
-            input=token.encode("utf-8"),
+            ["gh", "secret", "set", secret, "--repo", opts["gh_repo"], "--body", token],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         if proc.returncode != 0:
@@ -1017,6 +1021,22 @@ def main():
         print("已写入 GitHub Secret %s（仓库 %s，令牌指纹 %s%s）"
               % (secret, opts["gh_repo"], fingerprint,
                  "，身份指纹 %s" % idf if idf else ""))
+
+        # ---- 推送自验：确认远端 Secret 的时间戳已前进 ----
+        # 之前出现过「Secret 显示已更新，Actions 却 401」的静默故障（非 argv 路径
+        # 写入的值损坏）。时间戳核对能在本机当场确认写入动作完成；值本身的健康
+        # 由下一次 run 的飞书卡片兜底（AUTH 时卡片会点名 Secret 与机器）。
+        try:
+            check = subprocess.run(
+                ["gh", "api", "repos/%s/actions/secrets/%s" % (opts["gh_repo"], secret),
+                 "--jq", ".updated_at"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            check = None
+        if check is not None and check.returncode == 0:
+            print("远端已确认更新：%s" % check.stdout.decode("utf-8", "replace").strip())
+        else:
+            print("[提醒] 未能确认远端更新时间（不影响写入），可稍后跑 --status 核对")
         return EXIT_OK
 
     if opts["gh_repo"]:
