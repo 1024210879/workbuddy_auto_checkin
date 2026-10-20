@@ -141,13 +141,14 @@ gh secret set FEISHU_WEBHOOK --repo <新账号>/workbuddy_auto_checkin --body "h
 powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo <新账号>/workbuddy_auto_checkin -RunNow
 ```
 
-行为：优先注册计划任务（登录后 1 分钟启动 `--watch` 常驻监视，进程被杀后自动重启）；**权限不足时自动降级**为写入
-「启动」文件夹的 vbs，它启动的 `.cmd` 会兜住同一个监视进程。`-RunNow` 会立刻跑一次并回显日志尾部。
+行为：注册计划任务「登录后 1 分钟跑一次」（**权限不足时自动降级**为写入「启动」文件夹的 vbs，效果一样），
+并在桌面生成「同步 WorkBuddy 令牌」快捷方式。`-RunNow` 会立刻跑一次并回显日志尾部。
 
-> **为什么要常驻盯着**：WorkBuddy 客户端每次启动都会轮换 `accessToken`，旧令牌立即作废。
-> 只在开机时同步一次，之后重启客户端，Secret 里就是废令牌 → Actions 稳定 `401`。
-> 实测踩过：客户端 20:42 轮换、轮询 tick 在 20:41，手动触发的运行正好落在窗口内失败。
-> 监视模式每 2 秒 `stat` 一次凭据文件，变了才同步，所以窗口从分钟级变成秒级。
+> **注意**：WorkBuddy 客户端每次启动都会轮换 `accessToken`，旧令牌立即作废。
+> 登录那次只覆盖开机场景；**中途关掉又打开客户端后，点一下桌面快捷方式**即可（约 3 秒）。
+> 快捷方式内部是 `refresh_token.py --wait 60`：凭据文件刚被写过才等待，否则秒退。
+
+> 新机器上如果路径/用户名含中文也没关系：`.cmd` 只用 `%~dp0` 与 `%LOCALAPPDATA%` 运行时展开。
 
 **中文路径：已处理。** 生成的 `.cmd` 只用 `%~dp0`（脚本自身位置）和 `%LOCALAPPDATA%`，
 由 cmd 运行时展开，项目路径和用户名带中文都不会变成 `?`；`.vbs` 在路径非 ASCII 时自动改用

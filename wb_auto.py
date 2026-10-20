@@ -141,7 +141,7 @@ def run_checkin(headers, endpoint):
     if scode == CODE_NO_NETWORK:
         return False, {"result": "NETWORK", "report": "网络不可达，签到未完成"}
     if scode in (401, 403):
-        return False, {"result": "AUTH", "report": "认证被拒（HTTP %s），令牌可能已过期：请启动电脑上的 WorkBuddy 后运行 refresh_token.py" % scode}
+        return False, {"result": "AUTH", "report": "认证被拒（HTTP %s），令牌已失效：本机打开 WorkBuddy 后点一下桌面「同步 WorkBuddy 令牌」" % scode}
     if not (200 <= scode < 300):
         return False, {"result": "ERROR", "report": "状态接口异常（HTTP %s）" % scode}
 

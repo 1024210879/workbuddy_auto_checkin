@@ -11,6 +11,7 @@ dist/
 *.spec
 # 由 setup_task.ps1 生成，内含本机绝对路径（多账号时带 -<ID> 后缀）
 scripts/run_refresh*.cmd
+scripts/sync_now*.cmd
 scripts/WorkBuddyTokenRefresh*.vbs
 # 本机工作记录与计划，含本机绝对路径和账号信息
 .workbuddy/

@@ -14,18 +14,17 @@
     python refresh_token.py --gh-repo OWNER/REPO --account WORK
     写入 WB_ACCESS_TOKEN_WORK。不带 --account 时仍写 WB_ACCESS_TOKEN（单账号 / 主号）。
 
-自动续期（配合定时计划任务，见 scripts/setup_task.ps1）：
-    python refresh_token.py --gh-repo OWNER/REPO --watch --log 日志路径
-    客户端每次启动都会轮换 accessToken（旧令牌立即失效），所以本脚本要一直在岗：
-    --watch 常驻监视凭据文件，一变就重推；没变化就什么都不做（只 stat，不调 GitHub）。
+手动同步（打开 WorkBuddy 之后跑一次，见 scripts/open_and_sync.cmd）：
+    python refresh_token.py --gh-repo OWNER/REPO --account ID --wait 60
+    客户端每次启动都会轮换 accessToken、旧令牌立即失效，所以「手动打开客户端」
+    之后必须重跑一次本脚本；--wait 会让它在客户端还没写完凭据时多等一会儿。
 
     可选参数：
       --account ID   把令牌写入 WB_ACCESS_TOKEN_ID（多账号时用来区分）。
                      只允许 A-Z 0-9 _，会统一转成大写。
-      --watch        常驻监视模式：凭据文件一变就立刻同步（推荐配合开机启动）。
       --min-days N   仅在没有历史推送记录时生效：令牌剩余不足 N 天就拒绝推送
                      （默认 3）。有记录时按「谁更新用谁」比较，不看剩余天数。
-      --wait SEC     登录后客户端可能尚未刷新完，最多等待 SEC 秒轮询凭据变化。
+      --wait SEC     打开客户端后立刻运行时，最多等 SEC 秒直到凭据换新。
       --check        只检查新鲜度，不做任何写入。
       --force        忽略新鲜度判断，强制推送。
       --log PATH     输出追加到日志文件（供静默运行使用，日志中绝不含 token）。
@@ -58,7 +57,7 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/-]+=*")
 
 DEFAULT_MIN_DAYS = 3.0        # 无推送记录时，剩余不足这么多天就不再推送
 POLL_INTERVAL = 5.0           # --wait 期间轮询凭据文件的间隔
-WATCH_INTERVAL = 2.0          # --watch 模式检测凭据文件变化的间隔（只 stat，几乎无开销）
+FRESH_WINDOW = 120.0          # 凭据文件在这个秒数内被写过，才认为客户端正在刷新，值得等待
 DEFAULT_SECRET = "WB_ACCESS_TOKEN"   # 单账号 / 主号用的 Secret 名
 ACCOUNT_RE = re.compile(r"[A-Z0-9_]{1,32}")
 EXIT_OK = 0
@@ -324,44 +323,6 @@ def secret_name(account):
     return DEFAULT_SECRET if not account else DEFAULT_SECRET + "_" + account
 
 
-def watch_loop(auth_file, argv):
-    """常驻监视凭据文件：客户端一写新令牌，几秒内就把 Secret 换掉。
-
-    为什么要监视而不是定时轮询：客户端轮换令牌后，旧令牌立即失效，
-    Secret 在「轮换完成」到「下一次轮询」之间是废的——这段时间里触发的
-    Actions 必然 401。轮询间隔越长，撞上的概率越高；监视模式把这段窗口
-    从「分钟级」压到「秒级」。
-
-    子进程复用本脚本的正常流程（含新鲜度闸门与去重），父进程只负责发现
-    变化，这样判断逻辑只有一份，不会在两种模式之间漂移。
-    """
-    args = [a for a in argv if a != "--watch"]
-    # 打包成 exe 时 sys.executable 本身就是入口，不能再把 .py 路径塞进去
-    if getattr(sys, "frozen", False):
-        child = [sys.executable] + args
-    else:
-        child = [sys.executable, os.path.abspath(sys.argv[0])] + args
-    print("[监视] 已启动，轮询间隔 %.0f 秒；凭据一变就立即同步" % WATCH_INTERVAL)
-    last = None
-    while True:
-        try:
-            st = os.stat(auth_file)
-            sig = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            time.sleep(WATCH_INTERVAL)
-            continue
-        if last is None or sig != last:
-            if last is not None:
-                print("\n[监视] 凭据文件已更新，开始同步…")
-                time.sleep(1.0)          # 等客户端把文件写完
-            last = sig
-            try:
-                subprocess.run(child, timeout=180)
-            except (OSError, subprocess.SubprocessError) as e:
-                print("[监视] 同步失败：%s" % e)
-        time.sleep(WATCH_INTERVAL)
-
-
 class _Tee:
     """把 stdout/stderr 同时写向日志文件与原控制台（有控制台时）。"""
 
@@ -422,7 +383,7 @@ def install_log(path):
 
 def parse_args(argv):
     opts = {"gh_repo": None, "min_days": DEFAULT_MIN_DAYS, "check": False,
-            "force": False, "log": None, "wait": 0.0, "account": "", "watch": False}
+            "force": False, "log": None, "wait": 0.0, "account": ""}
     numeric = {"--min-days": "min_days", "--wait": "wait"}
     i = 0
     while i < len(argv):
@@ -451,10 +412,8 @@ def parse_args(argv):
             opts["check"] = True
         elif arg == "--force":
             opts["force"] = True
-        elif arg == "--watch":
-            opts["watch"] = True
         else:
-            raise SystemExit("未知参数：%s（可用：--gh-repo --account --min-days --wait --check --force --watch --log）" % arg)
+            raise SystemExit("未知参数：%s（可用：--gh-repo --account --min-days --wait --check --force --log）" % arg)
         i += 1
     return opts
 
@@ -538,12 +497,28 @@ def write_state(secret, expires_at, fingerprint=""):
         pass
 
 
-def wait_for_refresh(path, session, seconds):
-    """登录后客户端可能还没刷新完，轮询凭据文件直到 expiresAt 变大。"""
+def wait_for_refresh(path, session, seconds, secret):
+    """等客户端把令牌换掉——打开 WorkBuddy 后立刻运行本脚本时用。
+
+    客户端启动时会先写旧凭据再刷新，这一刻读文件可能拿到即将作废的那枚。
+    但多数时候并没有「正在启动」这回事，白等几十秒很难受，所以先用文件 mtime
+    判断：凭据最近两分钟内被写过，才值得等（客户端刚起来）；
+    否则直接返回，让后面的闸门判断要不要推送。
+    """
+    recorded = pushed_expiry(secret)
     before = token_expiry(session)
-    if before is None or before - time.time() > DEFAULT_MIN_DAYS * 86400:
+    base = recorded if recorded is not None else before
+    if base is None:
         return session
-    print("令牌尚未刷新，等待客户端刷新（最多 %d 秒）…" % int(seconds))
+    if before is not None and before > base + 1:
+        return session                      # 已经是新的，不用等
+    try:
+        age = time.time() - os.stat(path).st_mtime
+    except OSError:
+        age = None
+    if age is None or age > FRESH_WINDOW:
+        return session                      # 凭据没刚被写过，不是在启动过程中
+    print("凭据刚被写入，等待客户端刷新（最多 %d 秒）…" % int(seconds))
     deadline = time.time() + seconds
     while time.time() < deadline:
         time.sleep(POLL_INTERVAL)
@@ -552,10 +527,10 @@ def wait_for_refresh(path, session, seconds):
         except (OSError, ValueError):
             continue
         after = token_expiry(fresh)
-        if after is not None and after > before:
-            print("检测到客户端已刷新令牌")
+        if after is not None and after > base + 1:
+            print("检测到客户端已刷新凭据")
             return fresh
-    print("等待超时，客户端没有刷新凭据")
+    print("等待超时，凭据没有变化")
     return session
 
 
@@ -572,14 +547,9 @@ def main():
         raise SystemExit("未找到凭据文件，请设置 WORKBUDDY_AUTH_FILE")
     print("凭据文件：%s" % auth_file)
 
-    # 监视模式：常驻进程，凭据一变就同步（把 401 窗口从分钟级压到秒级）
-    if opts["watch"]:
-        watch_loop(auth_file, sys.argv[1:])
-        return EXIT_OK
-
     session = load_session(auth_file)
     if opts["wait"] > 0:
-        session = wait_for_refresh(auth_file, session, opts["wait"])
+        session = wait_for_refresh(auth_file, session, opts["wait"], secret)
 
     # ---- 新鲜度闸门：宁可不写，也不能把坏令牌覆盖进 Secret ----
     # 关键背景：客户端每次启动都会轮换 accessToken，旧令牌立即失效。
