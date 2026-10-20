@@ -239,7 +239,20 @@ gh auth login
 然后在项目目录执行：
 
 ```
-powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用户名/workbuddy_auto_checkin
+powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1
+```
+
+**直接回车即可** —— 脚本会自己问你两件事，不用记参数：
+
+| 问题 | 怎么答 |
+| --- | --- |
+| `本机账号 id [回车沿用 <上次>]` | 填这个账号在 `WB_ACCOUNTS` 里的 id（如 `WORK`）；回车 = 沿用本机上一次的值。从来没有过则回车表示单账号模式（写 `WB_ACCESS_TOKEN`） |
+| `GitHub 仓库 [回车 = 推断值]` | 回车即可，默认值由 `git remote origin` 自动推出，正常情况敲两次回车就完事 |
+
+想跳过提问、纯脚本化调用，就把参数给全（参数齐全时不会出现任何提示）：
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用户名/workbuddy_auto_checkin -Account 你的ID
 ```
 
 加 `-RunNow` 可当场试跑并回显日志。
@@ -277,7 +290,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 | --- | --- |
 | 开机登录（客户端随后自己启动） | 不用管，登录后 1 分钟自动同步 |
 | 中途关掉客户端又重新打开 | 点一下桌面「同步 WorkBuddy 令牌」，约 3 秒 |
-| 换机器 / 换账号 | 在新机器上跑一次 `setup_task.ps1 -Account <ID>` |
+| 换机器 / 换账号 | 在新机器上跑一次 `setup_task.ps1`，按提示输入账号 id |
 
 快捷方式执行的是 `refresh_token.py --wait 60`，它很聪明地决定要不要等：
 

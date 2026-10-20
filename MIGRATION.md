@@ -138,8 +138,13 @@ gh secret set FEISHU_WEBHOOK --repo <新账号>/workbuddy_auto_checkin --body "h
 ## 5. 注册自动续期（新机器上跑）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo <新账号>/workbuddy_auto_checkin -RunNow
+powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1
 ```
+
+不带参数运行：脚本先问你「GitHub 仓库」（默认值从 `git remote origin` 推出，回车即用），
+再问「本机账号 id」（回车沿用本机已有登录项里的账号；没有历史则回车 = 单账号模式）。
+纯脚本化调用时把参数给全即可跳过提问：
+`setup_task.ps1 -Repo <账号>/workbuddy_auto_checkin -Account <ID> -RunNow`。
 
 行为：注册计划任务「登录后 1 分钟跑一次」（**权限不足时自动降级**为写入「启动」文件夹的 vbs，效果一样），
 并在桌面生成「同步 WorkBuddy 令牌」快捷方式。`-RunNow` 会立刻跑一次并回显日志尾部。

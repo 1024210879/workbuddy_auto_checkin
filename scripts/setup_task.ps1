@@ -10,16 +10,22 @@
     需要先安装 GitHub CLI 并登录：winget install --id GitHub.cli && gh auth login
 
     多账号：同一个仓库托管多个 WorkBuddy 账号时，用 -Account 指定本机
-    对应哪个账号（令牌会写进 WB_ACCESS_TOKEN_<ID>）。
+    对应哪个账号（令牌会写进 WB_ACCESS_TOKEN_<ID>）。**不传 -Account 时脚本
+    会直接问你**（回车沿用本机上次的账号，没有历史则回车表示单账号模式）；
+    不传 -Repo 时也会先尝试从 git remote 推断，推不出来再问你。
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 用户名/仓库名
+    powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1
+
+    不带参数运行：依次询问仓库与账号 id，其余用默认值。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 用户名/仓库名 -RunNow
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 用户名/仓库名 -Account WORK
+
+    适合脚本化调用：全参数给出时不会出现任何提问。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Uninstall
@@ -53,10 +59,52 @@ param(
     [switch]$RunNow,
 
     # 不生成桌面「同步 WorkBuddy 令牌」快捷方式
-    [switch]$NoShortcut
+    [switch]$NoShortcut,
+
+    # 完全不做任何提问：缺 -Repo / -Account 时直接用参数值（空即单账号模式）
+    # 供计划任务、批处理、CI 等无人值守的调用使用
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = "Stop"
+
+# 只有真正的交互式控制台才提问；被批处理 / 计划任务 / CI 调用时直接走参数，
+# 否则 Read-Host 会一直等输入，把静默调用卡死。
+# -NonInteractive（或环境变量 WB_NO_PROMPT=1）可强制关掉提问。
+$canPrompt = (-not $NonInteractive) -and (-not $env:WB_NO_PROMPT) -and
+             (-not [Console]::IsInputRedirected) -and [Environment]::UserInteractive
+
+# 已在用的账号 id（从本机已有的登录启动项里读），作为提问时的默认值
+$knownAccounts = @()
+foreach ($vbs in (Get-ChildItem -LiteralPath ([Environment]::GetFolderPath("Startup")) `
+            -Filter "WorkBuddyTokenRefresh-*.vbs" -ErrorAction SilentlyContinue)) {
+    $knownAccounts += ($vbs.BaseName -replace '^WorkBuddyTokenRefresh-', '')
+}
+
+# ---- 账号 id：没在命令行给就问一次，回车沿用上次 / 单账号模式 ----
+if (-not $Account -and -not $Uninstall -and $canPrompt) {
+    Write-Host ""
+    Write-Host "本机账号 id 会拼成 Secret 名 WB_ACCESS_TOKEN_<ID>，" -ForegroundColor Cyan
+    Write-Host "必须和仓库变量 WB_ACCOUNTS 里的 id 一致（可留空表示单账号）。" -ForegroundColor Cyan
+    if ($knownAccounts.Count -ge 1) {
+        Write-Host ("本机已有账号：{0}" -f ($knownAccounts -join ", ")) -ForegroundColor DarkGray
+    }
+    $defaultAccount = if ($knownAccounts.Count -ge 1) { $knownAccounts[0] } else { "" }
+    while ($true) {
+        if ($defaultAccount) {
+            $typed = Read-Host ("本机账号 id [回车沿用 {0}]" -f $defaultAccount)
+        } else {
+            $typed = Read-Host "本机账号 id [回车 = 单账号模式，写 WB_ACCESS_TOKEN]"
+        }
+        if ($null -eq $typed) { $typed = "" }
+        $typed = $typed.Trim()
+        if (-not $typed) { $typed = $defaultAccount }
+        if (-not $typed) { break }                       # 单账号模式，合法
+        if ($typed -match '^[A-Za-z0-9_]{1,32}$') { $Account = $typed; break }
+        Write-Host "  只能用字母、数字、下划线，1~32 位，请重新输入。" -ForegroundColor Yellow
+    }
+    Write-Host ""
+}
 
 # 账号 id 会拼进 Secret 名，先归一化再用于任务名、日志名、启动项名
 $Account = ($Account -as [string])
@@ -203,8 +251,42 @@ if ($Uninstall) {
     return
 }
 
+# 仓库：没给就试着从 git remote 推出来，推不出来再问
+if (-not $Repo -and $canPrompt) {
+    $guess = ""
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $url = (git -C (Split-Path -Parent $scriptDir) remote get-url origin 2>$null)
+        if ($url -and $url -match 'github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$') {
+            $guess = $Matches[1] + "/" + $Matches[2]
+        }
+    }
+    while ($true) {
+        if ($guess) {
+            $typed = Read-Host ("GitHub 仓库 [回车 = {0}]" -f $guess)
+        } else {
+            $typed = Read-Host "GitHub 仓库（形如 用户名/仓库名）"
+        }
+        if ($null -eq $typed) { $typed = "" }
+        $typed = $typed.Trim()
+        if (-not $typed) { $typed = $guess }
+        if ($typed -match '^[^/\s]+/[^/\s]+$' -and -not $typed.Contains("github.com")) {
+            $Repo = $typed
+            break
+        }
+        Write-Host "  格式应为 用户名/仓库名，不要带 https:// 或 .git，请重新输入。" -ForegroundColor Yellow
+    }
+    Write-Host ""
+}
+
+# 同一台机器再次运行时，如果既有登录项又没说清是哪个账号，提示一下别弄错
+if ($canPrompt -and $knownAccounts.Count -gt 1 -and $knownAccounts -notcontains $Account) {
+    Write-Host ("[提示] 本机已有这些账号的登录项：{0}" -f ($knownAccounts -join ", ")) -ForegroundColor Yellow
+    Write-Host ("       本次按 '{0}' 注册，会新增一套启动项与桌面快捷方式。" -f $(if ($Account) { $Account } else { "单账号模式" })) -ForegroundColor Yellow
+    Write-Host ""
+}
+
 if (-not $Repo) {
-    Write-Host "[x] 必须用 -Repo 指定你的仓库，例如：-Repo 1024210879/workbuddy_auto_checkin" -ForegroundColor Red
+    Write-Host "[x] 必须用 -Repo 指定你的仓库，例如：-Repo 用户名/workbuddy_auto_checkin" -ForegroundColor Red
     exit 1
 }
 
