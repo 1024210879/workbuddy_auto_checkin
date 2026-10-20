@@ -141,12 +141,13 @@ gh secret set FEISHU_WEBHOOK --repo <新账号>/workbuddy_auto_checkin --body "h
 powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo <新账号>/workbuddy_auto_checkin -RunNow
 ```
 
-行为：优先注册计划任务（登录后 1 分钟 + **每 5 分钟**重复，`-IntervalMinutes` 可调）；**权限不足时自动降级**为写入
-「启动」文件夹的 vbs，它启动的 `.cmd` 自己循环，效果等价。`-RunNow` 会立刻跑一次并回显日志尾部。
+行为：优先注册计划任务（登录后 1 分钟启动 `--watch` 常驻监视，进程被杀后自动重启）；**权限不足时自动降级**为写入
+「启动」文件夹的 vbs，它启动的 `.cmd` 会兜住同一个监视进程。`-RunNow` 会立刻跑一次并回显日志尾部。
 
-> **为什么要每 5 分钟一次**：WorkBuddy 客户端每次启动都会轮换 `accessToken`，旧令牌立即作废。
-> 只在开机时同步一次，之后重启客户端，Secret 里就是废令牌 → 次日 Actions 稳定 `401`。
-> 脚本会先比对本机令牌与已推送令牌，没变化就直接退出，不会频繁调用 GitHub。
+> **为什么要常驻盯着**：WorkBuddy 客户端每次启动都会轮换 `accessToken`，旧令牌立即作废。
+> 只在开机时同步一次，之后重启客户端，Secret 里就是废令牌 → Actions 稳定 `401`。
+> 实测踩过：客户端 20:42 轮换、轮询 tick 在 20:41，手动触发的运行正好落在窗口内失败。
+> 监视模式每 2 秒 `stat` 一次凭据文件，变了才同步，所以窗口从分钟级变成秒级。
 
 **中文路径：已处理。** 生成的 `.cmd` 只用 `%~dp0`（脚本自身位置）和 `%LOCALAPPDATA%`，
 由 cmd 运行时展开，项目路径和用户名带中文都不会变成 `?`；`.vbs` 在路径非 ASCII 时自动改用

@@ -3,9 +3,10 @@
     注册「开机自动把本机 WorkBuddy 令牌同步到 GitHub Secret」的计划任务。
 
 .DESCRIPTION
-    每次登录时立即跑一次，之后每隔 N 分钟（默认 5）再跑一次 refresh_token.py。
-    WorkBuddy 客户端每次启动都会轮换令牌、旧令牌立即失效，所以必须周期性同步；
-    脚本自己比对「本机令牌 vs 已推送令牌」，没变化就直接退出，不会频繁调 GitHub。
+    每次登录时启动 refresh_token.py 的常驻监视模式（--watch）：
+    客户端一旦轮换令牌，2 秒内就把新令牌同步到 Secret。
+    WorkBuddy 客户端每次启动都会轮换令牌、旧令牌立即失效，所以必须常驻盯着；
+    脚本自己比对「本机令牌 vs 已推送令牌」，没变化就什么都不做，不会频繁调 GitHub。
 
     需要先安装 GitHub CLI 并登录：winget install --id GitHub.cli && gh auth login
 
@@ -32,12 +33,15 @@ param(
     # 多账号：本机对应哪个账号（令牌写入 WB_ACCESS_TOKEN_<ID>）；留空写 WB_ACCESS_TOKEN
     [string]$Account = "",
 
-    # 同步间隔（分钟）。设为 0 则只在登录时跑一次
+    # 同步方式：
+    #   0（默认）= 常驻监视模式（--watch）。脚本一直待命，凭据文件一变就在 2 秒内
+    #              把新令牌推到 Secret —— 客户端轮换令牌后几乎不存在失效窗口
+    #   > 0      = 定时轮询模式，每 N 分钟起一次短进程（不常驻，但窗口最长 N 分钟）
     #
-    # 为什么需要周期性：WorkBuddy 客户端每次启动都会轮换 accessToken，
-    # 旧令牌立即失效。只在开机时同步，之后重启一次客户端，Secret 就变成废令牌，
-    # Actions 会稳定 401。间隔越短，令牌失效的窗口越小。
-    [double]$IntervalMinutes = 5,
+    # 为什么这么在意窗口：WorkBuddy 客户端每次启动都会轮换 accessToken，
+    # 旧令牌立即失效。Secret 在「轮换完成」到「同步完成」之间是废的，
+    # 这段时间里触发的 Actions 必然 401。
+    [double]$IntervalMinutes = 0,
 
     # 没有历史推送记录时的兜底：令牌剩余不足这么多天就不推送
     [double]$MinDays = 3,
@@ -99,6 +103,7 @@ function Install-StartupLauncher {
         [double]$MinDays,
         [double]$WaitSeconds,
         [double]$IntervalMinutes,
+        [switch]$WatchMode,
         [string]$Suffix,
         [string]$CmdPath
     )
@@ -115,18 +120,23 @@ function Install-StartupLauncher {
     if ($Prefix) { $call += " " + $Prefix }
     $call += ' "%~dp0..\refresh_token.py" --gh-repo ' + $Repo
     if ($Account) { $call += ' --account ' + $Account }
+    if ($WatchMode) { $call += ' --watch' }
     $call += ' --min-days ' + $MinDays + ' --wait ' + $WaitSeconds + ' --log "' + $logExpr + '"'
 
     $lines = @(
         '@echo off'
         'setlocal'
-        'rem Client rotates the token on every start; old one dies instantly -> sync periodically'
+        'rem Client rotates the token on every start; old one dies instantly -> keep watching'
         'set "STOP=' + $stopExpr + '"'
         ':loop'
         'if exist "%STOP%" exit /b 0'
         $call
     )
-    if ($IntervalMinutes -gt 0) {
+    if ($WatchMode) {
+        # 常驻进程意外退出时 30 秒后重新拉起；正常退出（有停止标记）不会走到这里
+        $lines += 'ping -n 31 127.0.0.1 >nul'
+        $lines += 'goto loop'
+    } elseif ($IntervalMinutes -gt 0) {
         # ping 当 sleep 用：timeout 在没有控制台时可能直接失败
         $ticks = [int]([math]::Round($IntervalMinutes * 60)) + 1
         $lines += ('ping -n ' + $ticks + ' 127.0.0.1 >nul')
@@ -148,10 +158,12 @@ function Install-StartupLauncher {
     Write-Host "[OK] 已改用登录启动方式（无需管理员权限）" -ForegroundColor Green
     Write-Host "     启动脚本：$startupVbs"
     Write-Host "     实际命令：$CmdPath"
-    if ($IntervalMinutes -gt 0) {
-        Write-Host ("     同步间隔：每 {0} 分钟一次（脚本会自己判断要不要真的推送）" -f $IntervalMinutes)
+    if ($WatchMode) {
+        Write-Host "     同步方式：常驻监视（凭据一变就推送，进程退出后 30 秒自动重启）"
+    } elseif ($IntervalMinutes -gt 0) {
+        Write-Host ("     同步方式：每 {0} 分钟轮询一次" -f $IntervalMinutes)
     } else {
-        Write-Host "     同步间隔：仅登录一次" -ForegroundColor Yellow
+        Write-Host "     同步方式：仅登录时跑一次" -ForegroundColor Yellow
     }
     return $startupVbs
 }
@@ -241,15 +253,19 @@ if (-not $launcherPath) {
     exit 1
 }
 
+$watchMode = ($IntervalMinutes -le 0)
+
 $waitSecondsUsed = $WaitSeconds
-# 周期性同步时不需要长时间等待客户端刷新：下一轮自然会看到新令牌
-if ($IntervalMinutes -gt 0 -and $waitSecondsUsed -gt 30) { $waitSecondsUsed = 30 }
+# 常驻监视模式下不用等：凭据一变就会被发现，--wait 会让子进程白等
+if ($watchMode) { $waitSecondsUsed = 0 }
+elseif ($IntervalMinutes -gt 0 -and $waitSecondsUsed -gt 30) { $waitSecondsUsed = 30 }
 
 $arguments = @()
 $arguments += $prefix
 $arguments += "`"$pyScript`""
 $arguments += @("--gh-repo", $Repo)
 if ($Account) { $arguments += @("--account", $Account) }
+if ($watchMode) { $arguments += "--watch" }
 $arguments += @("--min-days", $MinDays, "--wait", $waitSecondsUsed, "--log", "`"$logFile`"")
 $argumentLine = ($arguments | ForEach-Object { $_.ToString() }) -join " "
 
@@ -264,17 +280,26 @@ $triggers = @()
 $logon = New-ScheduledTaskTrigger -AtLogOn
 $logon.Delay = "PT1M"     # 登录后客户端要一点时间把凭据刷新完
 $triggers += $logon
-if ($IntervalMinutes -gt 0) {
-    # 关键：客户端每重启一次就轮换令牌，只在登录时同步必然失效，所以要有重复触发
+if (-not $watchMode -and $IntervalMinutes -gt 0) {
+    # 定时轮询模式的兜底：客户端重启会轮换令牌，只靠登录触发必然失效
     $triggers += New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($IntervalMinutes) `
         -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
         -RepetitionDuration (New-TimeSpan -Days 3650)
 }
 
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+if ($watchMode) {
+    # 常驻进程：不限制运行时长；万一被杀，一分钟后再拉起
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+} else {
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+}
 
 try {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
@@ -285,7 +310,9 @@ try {
     Write-Host "     Secret：$secretName$(if ($Account) { "（账号 $Account）" })"
     Write-Host "     启动器：$launcherPath"
     Write-Host "     参数  ：$argumentLine"
-    if ($IntervalMinutes -gt 0) {
+    if ($watchMode) {
+        Write-Host "     触发  ：登录后 1 分钟启动常驻监视（不退出，被终止则 1 分钟后重启）"
+    } elseif ($IntervalMinutes -gt 0) {
         Write-Host ("     触发  ：登录后 1 分钟 + 每 {0} 分钟一次" -f $IntervalMinutes)
     } else {
         Write-Host "     触发  ：仅登录后 1 分钟"
@@ -297,13 +324,13 @@ try {
     Write-Host "    改为写入「启动」文件夹（登录时运行，不需要管理员权限）`n"
     if (-not (Install-StartupLauncher -Launcher $launcherName -Prefix ($prefix -join " ") `
                 -Repo $Repo -Account $Account -MinDays $MinDays -WaitSeconds $waitSecondsUsed `
-                -IntervalMinutes $IntervalMinutes -Suffix $suffix -CmdPath $cmdFile)) {
+                -IntervalMinutes $IntervalMinutes -WatchMode:$watchMode -Suffix $suffix -CmdPath $cmdFile)) {
         Write-Host "    如要使用计划任务，请以管理员身份打开 PowerShell 后重跑本脚本。" -ForegroundColor Red
         exit 1
     }
     Write-Host "     Secret：$secretName$(if ($Account) { "（账号 $Account）" })"
     Write-Host "     日志  ：$logFile"
-    Write-Host "     说明  ：登录启动靠 .cmd 自己循环，注销/重启后才会重新开始。" -ForegroundColor DarkGray
+    Write-Host "     说明  ：登录启动靠 .cmd 兜住，注销/重启后才会重新开始。" -ForegroundColor DarkGray
 }
 
 if ($RunNow) {
@@ -313,8 +340,11 @@ if ($RunNow) {
         if ($registered) {
             Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
         } else {
-            # 降级模式不能直接跑 .cmd（它是个死循环），单独起一个后台进程
-            Start-Process -FilePath $launcherPath -ArgumentList $argumentLine -WindowStyle Hidden
+            # 降级模式不能直接跑 .cmd（它是个自循环），单独起一个进程。
+            # 常驻监视模式下这里只做一次同步：去掉 --watch，避免多起一个常驻实例。
+            $onceLine = $argumentLine
+            if ($watchMode) { $onceLine = $argumentLine -replace '\s--watch', '' }
+            Start-Process -FilePath $launcherPath -ArgumentList $onceLine -WindowStyle Hidden
         }
     } catch {
         Write-Host "[!] 触发失败：$($_.Exception.Message)" -ForegroundColor Yellow

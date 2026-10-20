@@ -244,22 +244,21 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 
 加 `-RunNow` 可当场试跑并回显日志。
 
-脚本会先尝试注册计划任务 `WorkBuddyTokenRefresh`，两个触发点：
-
-- **登录后 1 分钟** — 客户端刚启动、凭据刚刷新完，立刻同步一次
-- **每 5 分钟一次**（`-IntervalMinutes`，设 0 可关掉）— 这才是主力，原因见下
+脚本会先尝试注册计划任务 `WorkBuddyTokenRefresh`：**登录后 1 分钟启动一个常驻监视进程**（`--watch`），它只做一件事——盯着凭据文件，一变就同步。进程被终止的话 1 分钟后自动重启。
 
 **如果注册被拒绝**（普通账户未提升权限时会这样），脚本会自动降级为「启动」文件夹方式，不需要任何管理员权限：
 
 - 生成 `scripts\run_refresh.cmd` 与 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\WorkBuddyTokenRefresh.vbs`
-- `.cmd` 自己带循环（跑一次 → `ping` 等 5 分钟 → 再跑），效果与计划任务等价
+- `.cmd` 跑同一个 `--watch`，进程退出后 30 秒重新拉起，效果与计划任务等价
 - `.cmd` 里只写 `%~dp0` 和 `%LOCALAPPDATA%`，安装路径/用户名带中文也不会变成 `?`
 - 想恢复真正的计划任务，用管理员身份打开 PowerShell 重跑一次本脚本即可
 
 移除（两种方式都会一并清理）：`powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Uninstall`
-降级模式下 `/Uninstall` 会写入 `refresh.stop` 停止标记，正在循环的 `.cmd` 下一轮就会退出。
+`/Uninstall` 会写入 `refresh.stop` 停止标记，并结束正在跑的监视进程。
 
-### 为什么必须「周期性」同步，而不是开机跑一次
+> 不想常驻进程？加 `-IntervalMinutes 5` 就退回「每 5 分钟跑一次短进程」的轮询模式，代价是令牌失效窗口从「秒级」变成「分钟级」。
+
+### 为什么必须一直盯着，而不是开机跑一次
 
 这是整套方案里最反直觉的一点：
 
@@ -269,10 +268,11 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 
 | 做法 | 结果 |
 | --- | --- |
-| 只在开机时同步一次 | 之后重启一次客户端，Secret 里就是废令牌，第二天 Actions 稳定 `401` |
-| 每 5 分钟同步一次 | 令牌失效窗口 ≤ 5 分钟，远小于每天一次的定时任务，`401` 基本消失 |
+| 只在开机时同步一次 | 之后重启一次客户端，Secret 里就是废令牌，再跑 Actions 稳定 `401` |
+| 每 5 分钟轮询一次 | 失效窗口 ≤ 5 分钟。实测踩到过：客户端 20:42 轮换、轮询 tick 在 20:41，手动触发正好落在窗口里，依旧 401 |
+| 常驻监视（默认） | 文件一变 2 秒内重推，窗口接近 0 |
 
-脚本本身很便宜：先只读凭据文件里的明文 `expiresAt`（不用解密），和本地记录的「已推送令牌」比一下，没变化就直接退出，**不会调用 GitHub**；只有发现本机令牌更新时才解密并写入 Secret。
+监视模式的开销可以忽略：每 2 秒只 `stat` 一次文件，**不读令牌、不解密、不调 GitHub**；只有 mtime 变了才起一次真正的同步（那次同步还会再走一遍「谁更新用谁」的闸门，没变化就直接退出）。
 
 ### 新鲜度闸门：谁更新用谁
 
@@ -289,7 +289,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 
 本地只在 `%LOCALAPPDATA%\workbuddy_auto_checkin\state.json` 里按 Secret 名分别记「已推送令牌的过期时刻 + 12 位指纹」，不含任何凭据。多账号时各记各的，不会互相把对方判成「已推送」。日志里也不会出现明文 token。
 
-所以最坏的情况是：你出差一个月回来，任务跳过了一次，Secret 里仍是你离开前那枚——重新打开 WorkBuddy（客户端自动续期）后，5 分钟内就会把新令牌同步上去，无需手工操作。
+所以最坏的情况是：你出差一个月回来，任务跳过了一次，Secret 里仍是你离开前那枚——重新打开 WorkBuddy（客户端自动续期）后，2 秒内就会把新令牌同步上去，无需手工操作。
 
 > `setup_task.ps1` 通过 `pythonw`/`pyw` 静默运行，不会弹黑窗口；日志在 `%LOCALAPPDATA%\workbuddy_auto_checkin\refresh.log`。
 > 仓库里的 `refresh_token.exe` 是在本次改动之前打包的，不含新逻辑；如果你用 exe 手动刷新，建议改用 `python refresh_token.py`（或重新打包）。
@@ -320,6 +320,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 你的用�
 | --- | --- |
 | `--gh-repo OWNER/REPO` | 直接写入仓库 Secret（需要 gh CLI） |
 | `--account ID` | 多账号：写入 `WB_ACCESS_TOKEN_<ID>`（id 自动转大写）。不带则写 `WB_ACCESS_TOKEN` |
+| `--watch` | 常驻监视：凭据文件一变就立刻同步（开机启动项用的就是它）。每 2 秒只 `stat`，不读令牌 |
 | `--min-days N` | 仅在没有推送记录时生效：剩余不足 N 天就拒绝推送（默认 3）。有记录时按「谁更新用谁」比较 |
 | `--wait SEC` | 登录后客户端尚未刷新完时，最多轮询等待这么多秒 |
 | `--check` | 只检查令牌新鲜度，不做任何写入 |
