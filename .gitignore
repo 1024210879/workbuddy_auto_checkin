@@ -10,7 +10,9 @@ build/
 dist/
 *.spec
 # 由 setup_task.ps1 生成，内含本机绝对路径（多账号时带 -<ID> 后缀）
-scripts/run_refresh*.cmd
+# 注：scripts/run_refresh.cmd 是统一入口、只含 %~dp0 相对路径，现在入库维护；
+# 只有按账号后缀生成的旧脚本与本机启动项需要忽略。
+scripts/run_refresh-*.cmd
 scripts/sync_now*.cmd
 scripts/WorkBuddyTokenRefresh*.vbs
 # 本机工作记录与计划，含本机绝对路径和账号信息

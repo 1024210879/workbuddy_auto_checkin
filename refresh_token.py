@@ -520,9 +520,9 @@ def ask_account():
 
     while True:
         if default:
-            tip = "本机账号 id [回车沿用 %s，输入 - 表示单账号模式]：" % default
+            tip = "本机账号 id [回车沿用上次的 %s，输入 - 表示单账号模式]：" % default
         else:
-            tip = "本机账号 id [回车 = 单账号模式]："
+            tip = "本机账号 id [本机没有记录，回车 = 单账号模式]："
         try:
             raw = input(tip)
         except (EOFError, OSError, RuntimeError):
@@ -540,8 +540,27 @@ def ask_account():
         print("  只能用字母、数字、下划线，1~32 位，请重新输入。")
 
 
+def mirror_last_account(account):
+    """把「上次用的账号」镜像成一行纯文本，供 .cmd 在提问前直接显示。
+
+    .cmd 是 ASCII 写的，也读不了 JSON（cmd 的 for /f 会把逗号、冒号当分隔符），
+    所以这里额外落一个 last_account.txt：内容就是账号 id，或 "-" 表示上次是
+    单账号模式。只是一个只读镜像，真相仍然是 state.json 的 last_account。
+    """
+    try:
+        os.makedirs(_data_dir(), exist_ok=True)
+        path = os.path.join(_data_dir(), "last_account.txt")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write((account or "-") + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def remember_account(account):
     """记下本次用的账号，下次提问时作为默认值（只存 id，不存令牌）。"""
+    mirror_last_account(account)
     state = read_state()
     if state.get("last_account") == account:
         return

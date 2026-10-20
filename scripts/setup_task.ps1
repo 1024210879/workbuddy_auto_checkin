@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     注册「开机自动把本机 WorkBuddy 令牌同步到 GitHub Secret」的计划任务。
 
@@ -6,6 +6,11 @@
     登录时自动跑一次 refresh_token.py，把本机令牌同步到 GitHub Secret；
     另外在桌面生成一个「同步 WorkBuddy 令牌」快捷方式——手动打开 / 重启
     WorkBuddy 客户端之后点一下它即可（客户端启动会轮换令牌，旧的那个立即失效）。
+
+    两种入口共用一个文件 scripts\run_refresh.cmd：
+      不带参数  = 手动（控制台，先问账号，结束停窗）——桌面快捷方式用；
+      --auto    = 静默（无窗口无提问，账号取 -Account）——登录启动降级方案用，
+                  这段由本脚本追加，-Uninstall 时摘掉。
 
     需要先安装 GitHub CLI 并登录：winget install --id GitHub.cli && gh auth login
 
@@ -131,7 +136,60 @@ $logDir = Join-Path $env:LOCALAPPDATA "workbuddy_auto_checkin"
 $logFile = Join-Path $logDir ("refresh" + $suffix + ".log")
 $startupDir = [Environment]::GetFolderPath("Startup")
 $startupVbs = Join-Path $startupDir ("WorkBuddyTokenRefresh" + $suffix + ".vbs")
-$cmdFile = Join-Path $scriptDir ("run_refresh" + $suffix + ".cmd")
+# 统一入口：手动同步与登录启动共用这一个 .cmd（自动段落由 Install-StartupLauncher 追加）
+$cmdFile = Join-Path $scriptDir "run_refresh.cmd"
+
+function New-AutoBlock {
+    <#
+        生成统一入口 run_refresh.cmd 里 "--auto" 段落（登录启动 / 静默用）。
+
+        为什么单独抽出来：手动模式（桌面快捷方式）与自动模式现在共用一个文件，
+        而自动段落只在「计划任务注册失败、降级到启动文件夹」时才需要。
+        没有自动段落时 .cmd 仍可当手动入口用，所以这里宁可失败也不写坏文件。
+
+        必须只含 ASCII：中文路径写进 .cmd 会被编码成 '?'。
+    #>
+    param(
+        [string]$Launcher,
+        [string]$Prefix,
+        [string]$Repo,
+        [string]$Account,
+        [double]$MinDays,
+        [double]$WaitSeconds,
+        [double]$IntervalMinutes,
+        [string]$Suffix
+    )
+
+    $logExpr = '%LOCALAPPDATA%\workbuddy_auto_checkin\refresh' + $Suffix + '.log'
+    $stopExpr = '%LOCALAPPDATA%\workbuddy_auto_checkin\refresh' + $Suffix + '.stop'
+
+    $call = '"' + $Launcher + '"'
+    if ($Prefix) { $call += " " + $Prefix }
+    $call += ' "%~dp0..\refresh_token.py" --gh-repo ' + $Repo
+    if ($Account) { $call += ' --account ' + $Account }
+    $call += ' --min-days ' + $MinDays + ' --wait ' + $WaitSeconds + ' --log "' + $logExpr + '"'
+
+    $lines = @(
+        'rem ---- auto mode: logon / background, never prompts (started by the logon .vbs) ----'
+        ':auto'
+        'set "ACCOUNT=' + $Account + '"'
+        'set "LOG=%LOCALAPPDATA%\workbuddy_auto_checkin\refresh' + $Suffix + '.log"'
+    )
+    if ($IntervalMinutes -gt 0) {
+        $lines += 'set "STOP=' + $stopExpr + '"'
+        $lines += ':loop'
+        $lines += 'if exist "%STOP%" exit /b 0'
+    }
+    $lines += $call
+    if ($IntervalMinutes -gt 0) {
+        # ping 当 sleep 用：timeout 在没有控制台时可能直接失败
+        $ticks = [int]([math]::Round($IntervalMinutes * 60)) + 1
+        $lines += ('ping -n ' + $ticks + ' 127.0.0.1 >nul')
+        $lines += 'goto loop'
+    }
+    $lines += 'exit /b 0'
+    return (($lines -join "`r`n") + "`r`n")
+}
 
 function Install-StartupLauncher {
     <#
@@ -139,9 +197,8 @@ function Install-StartupLauncher {
         不需要管理员权限，也不需要任务计划服务；代价是没有真正的定时器，
         所以让 .cmd 自己循环（跑一次 → 等 N 分钟 → 再跑），效果与计划任务等价。
 
-        .cmd 必须只含 ASCII：中文路径写进 .cmd 会被编码成 '?'。
-        因此脚本路径用 %~dp0..（相对自身位置），日志用 %LOCALAPPDATA%，
-        两者都由 cmd 运行时展开，与用户名/安装路径是否含中文无关。
+        启动项现在指向统一入口 <CmdPath> --auto：cmd 里不能提问（无控制台），
+        账号来自安装时的 -Account，所以自动段落里 --account 是写死的。
     #>
     param(
         [string]$Launcher,          # 裸命令名，如 pyw / pythonw
@@ -159,40 +216,22 @@ function Install-StartupLauncher {
         Write-Host "[x] 找不到「启动」文件夹，无法降级。" -ForegroundColor Red
         return $null
     }
-
-    $logExpr = '%LOCALAPPDATA%\workbuddy_auto_checkin\refresh' + $Suffix + '.log'
-    $stopExpr = '%LOCALAPPDATA%\workbuddy_auto_checkin\refresh' + $Suffix + '.stop'
-
-    $call = '"' + $Launcher + '"'
-    if ($Prefix) { $call += " " + $Prefix }
-    $call += ' "%~dp0..\refresh_token.py" --gh-repo ' + $Repo
-    if ($Account) { $call += ' --account ' + $Account }
-    $call += ' --min-days ' + $MinDays + ' --wait ' + $WaitSeconds + ' --log "' + $logExpr + '"'
-
-    $lines = @(
-        '@echo off'
-        'setlocal'
-        'rem Client rotates the token on every start; old one dies instantly'
-    )
-    if ($IntervalMinutes -gt 0) {
-        $lines += 'set "STOP=' + $stopExpr + '"'
-        $lines += ':loop'
-        $lines += 'if exist "%STOP%" exit /b 0'
+    if (-not (Test-Path -LiteralPath $CmdPath)) {
+        Write-Host "[x] 找不到统一入口 $CmdPath，无法挂自动段落。" -ForegroundColor Red
+        return $null
     }
-    $lines += $call
-    if ($IntervalMinutes -gt 0) {
-        # ping 当 sleep 用：timeout 在没有控制台时可能直接失败
-        $ticks = [int]([math]::Round($IntervalMinutes * 60)) + 1
-        $lines += ('ping -n ' + $ticks + ' 127.0.0.1 >nul')
-        $lines += 'goto loop'
-    }
-    $cmdContent = ($lines -join "`r`n") + "`r`n"
-    [IO.File]::WriteAllText($CmdPath, $cmdContent, [Text.Encoding]::ASCII)
+
+    # 已有自动段落先摘掉，保证多次运行不会叠加出第二份 :auto / :loop
+    $autoBlock = New-AutoBlock -Launcher $Launcher -Prefix $Prefix -Repo $Repo -Account $Account `
+        -MinDays $MinDays -WaitSeconds $WaitSeconds -IntervalMinutes $IntervalMinutes -Suffix $Suffix
+    $existing = [IO.File]::ReadAllText($CmdPath)
+    $existing = [regex]::Replace($existing, "(?s)\r?\nrem ---- auto mode.*\z", "`r`n")
+    [IO.File]::WriteAllText($CmdPath, $existing.TrimEnd() + "`r`n`r`n" + $autoBlock, [Text.Encoding]::ASCII)
 
     $vbsContent = @(
         "' Generated by setup_task.ps1 - sync WorkBuddy token on logon"
         "Set sh = CreateObject(`"WScript.Shell`")"
-        "sh.Run `"`"`"$CmdPath`"`"`", 0, False"
+        "sh.Run `"`"`"$CmdPath`"`" --auto`", 0, False"
     ) -join "`r`n"
     # 路径含中文时 ASCII 会写成 '?'，此时改用 UTF-16LE（WSH 支持带 BOM 的 Unicode 脚本）
     $cmdIsAscii = ($CmdPath -notmatch '[^\x00-\x7F]')
@@ -229,8 +268,10 @@ if ($Uninstall) {
         $removed = $true
     }
     if (-not $removed) { Write-Host "[--] 没找到已注册的计划任务或启动项：$TaskName" }
-    # 桌面快捷方式与它的 .cmd：新版是通用的「同步 WorkBuddy 令牌」，
-    # 旧版按账号后缀命名。本机若还有别的账号在用，通用那份要留着。
+    # 桌面快捷方式：新版是通用的「同步 WorkBuddy 令牌」，旧版按账号后缀命名。
+    # 本机若还有别的账号在用，通用那份要留着。
+    # 注意：统一入口 run_refresh.cmd 同时服务桌面快捷方式与启动项，不能整文件删除，
+    # 这里只摘掉它里面的自动段落，手动模式段落保留（删了快捷方式就指向空气）。
     $desktop = [Environment]::GetFolderPath("Desktop")
     $stillUsed = @(Get-ChildItem -LiteralPath $startupDir -Filter "WorkBuddyTokenRefresh-*.vbs" -ErrorAction SilentlyContinue).Count -gt 0
     $targets = @(Join-Path $desktop ("同步 WorkBuddy 令牌" + $(if ($Account) { "（" + $Account + "）" } else { "" }) + ".lnk"))
@@ -243,6 +284,17 @@ if ($Uninstall) {
         if (Test-Path -LiteralPath $t) {
             Remove-Item -LiteralPath $t -Force
             Write-Host "[OK] 已移除：$t" -ForegroundColor Green
+        }
+    }
+    if (-not $stillUsed) {
+        $entryCmd = Join-Path $scriptDir "run_refresh.cmd"
+        if (Test-Path -LiteralPath $entryCmd) {
+            $body = [IO.File]::ReadAllText($entryCmd)
+            if ($body -match "(?s)\r?\nrem ---- auto mode") {
+                $body = [regex]::Replace($body, "(?s)\r?\nrem ---- auto mode.*\z", "`r`n")
+                [IO.File]::WriteAllText($entryCmd, $body.TrimEnd() + "`r`n", [Text.Encoding]::ASCII)
+                Write-Host "[OK] 已摘掉统一入口里的自动段落：$entryCmd（手动模式保留）" -ForegroundColor Green
+            }
         }
     }
     # 多账号时其它账号各自的启动项不会被这条命令带走，提示一下免得以为清干净了
@@ -407,18 +459,19 @@ try {
     }
     Write-Host "     Secret：$secretName$(if ($Account) { "（账号 $Account）" })"
     Write-Host "     日志  ：$logFile"
-    Write-Host "     说明  ：登录启动靠 .cmd 兜住，注销/重启后才会重新开始。" -ForegroundColor DarkGray
-}
+    Write-Host "     说明  ：登录启动靠 .cmd 兜住，注销/重启后才会重新开始。" -ForegroundColor DarkGray}
 
 # ---------------------------------------------- 桌面快捷方式（手动同步用）
 # 场景：登录脚本只在开机时跑一次；你中途关掉再打开 WorkBuddy，客户端会轮换
 # 令牌，这一枚才是有效的。点一下这个快捷方式就能把新令牌推上去。
 if (-not $NoShortcut) {
-    # 通用入口：不带账号，运行时由 refresh_token.py --ask-account 问你。
-    # 这样 .cmd 里不会写死某台机器的 id，换账号也不用重新生成。
-    $syncCmd = Join-Path $scriptDir "sync_now.cmd"
-    # 旧版按账号后缀生成的 .cmd 一并清掉，免得两套入口并存
-    foreach ($stale in (Get-ChildItem -LiteralPath $scriptDir -Filter "sync_now-*.cmd" -ErrorAction SilentlyContinue)) {
+    # 统一入口：run_refresh.cmd。同一个文件两种模式——
+    #   不带参数 = 手动模式，控制台、先问账号（回车沿用上次，- 表示单账号）；
+    #   带 --auto = 静默模式，账号来自本脚本的 -Account，由登录项调用。
+    # 这样仓库里只有一个 .cmd，换账号也不用重新生成。
+    $syncCmd = Join-Path $scriptDir "run_refresh.cmd"
+    # 旧版按账号后缀生成的 .cmd、以及上一个版本的独立 sync_now.cmd 一并清掉
+    foreach ($stale in (Get-ChildItem -LiteralPath $scriptDir -Filter "sync_now*.cmd" -ErrorAction SilentlyContinue)) {
         Remove-Item -LiteralPath $stale.FullName -Force
         Write-Host "[--] 已清理旧脚本：$($stale.Name)"
     }
@@ -432,12 +485,54 @@ if (-not $NoShortcut) {
         $syncLines = @(
             '@echo off'
             'setlocal'
+            'rem Single entry point for the WorkBuddy token sync. Two modes:'
+            'rem   no argument  = manual (console): ask the account, push, pause before closing'
+            'rem   --auto       = background (logon .vbs): account from setup_task.ps1 -Account'
+            'rem The "--auto" block is appended by setup_task.ps1 and stripped on -Uninstall.'
+            'rem This file must stay ASCII: it is written with ASCII encoding, non-ASCII -> "?".'
+            'if /i "%~1"=="--auto" goto auto'
+            ''
             'title WorkBuddy token sync'
+            'rem last_account.txt is a one-line mirror written by refresh_token.py:'
+            'rem   LINJJ           = the account used last time (shown in the prompt below)'
+            'rem   -               = last run was single-account mode'
+            'rem   (file missing)  = never synced on this machine'
+            'set "LASTACC="'
+            'if exist "%LOCALAPPDATA%\workbuddy_auto_checkin\last_account.txt" for /f "usebackq delims=" %%L in ("%LOCALAPPDATA%\workbuddy_auto_checkin\last_account.txt") do set "LASTACC=%%L"'
+            'if "%LASTACC%"=="-" set "LASTACC="'
+            'if defined LASTACC goto asklast'
+            ''
+            'set /p "ACCOUNT=Account id [no last account yet, Enter = single-account mode]: "'
+            'goto afterask'
+            ''
+            ':asklast'
+            'set /p "ACCOUNT=Account id [Enter = %LASTACC%, - = single-account mode]: "'
+            ''
+            ':afterask'
+            'if defined ACCOUNT goto typed'
+            'goto runask'
+            ''
+            ':typed'
+            'rem strip quotes so the id cannot break out of the argument'
+            'set "ACCOUNT=%ACCOUNT:"=%"'
+            'if "%ACCOUNT%"=="-" set "ACCOUNT="'
+            'if not defined ACCOUNT goto runask'
+            'rem Client rotates the token on every start; old one dies instantly'
             '"' + $console + '" ' + $consolePrefix + '"%~dp0..\refresh_token.py" --gh-repo ' + $Repo +
-                ' --ask-account --wait 60 --log "' + '%LOCALAPPDATA%\workbuddy_auto_checkin\sync.log"'
+                ' --account "%ACCOUNT%" --min-days 3 --wait 60 --log "%LOCALAPPDATA%\workbuddy_auto_checkin\refresh-%ACCOUNT%.log"'
+            'set "LOGPATH=%LOCALAPPDATA%\workbuddy_auto_checkin\refresh-%ACCOUNT%.log"'
+            'goto done'
+            ''
+            ':runask'
+            '"' + $console + '" ' + $consolePrefix + '"%~dp0..\refresh_token.py" --gh-repo ' + $Repo +
+                ' --ask-account --min-days 3 --wait 60 --log "%LOCALAPPDATA%\workbuddy_auto_checkin\refresh.log"'
+            'set "LOGPATH=%LOCALAPPDATA%\workbuddy_auto_checkin\refresh.log"'
+            ''
+            ':done'
             'echo.'
-            'echo ---- done. log: %LOCALAPPDATA%\workbuddy_auto_checkin\sync.log'
+            'echo ---- done. log: %LOGPATH%'
             'ping -n 9 127.0.0.1 >nul'
+            'exit /b 0'
         )
         [IO.File]::WriteAllText($syncCmd, (($syncLines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
 

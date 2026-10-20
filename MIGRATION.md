@@ -10,8 +10,8 @@
 | 类别 | 具体东西 | 处理方式 |
 | --- | --- | --- |
 | 能直接复制 | 源码、`.github/workflows/`、`scripts/setup_task.ps1`、`README.md` | 走 `git clone`，不要手工拷文件夹 |
-| **必须新机器重新生成** | `%APPDATA%\...\Startup\WorkBuddyTokenRefresh.vbs`、`scripts\run_refresh.cmd` | 里面写死了旧机的绝对路径，复制过去等于指向不存在的文件。必须跑一次 `setup_task.ps1` |
-| **必须新机器重新生成** | `%LOCALAPPDATA%\workbuddy_auto_checkin\state.json`、`refresh.log` | 去重状态和日志，属于本机状态。`state.json` 尤其不要拷——它按 `expiresAt` 去重且不区分仓库，拷过去可能让新机误判「已推送过」而跳过写入 |
+| **必须新机器重新生成** | `%APPDATA%\...\Startup\WorkBuddyTokenRefresh.vbs`、`scripts\run_refresh.cmd` | 里面写死了旧机的绝对路径，复制过去等于指向不存在的文件。必须跑一次 `setup_task.ps1`（`run_refresh.cmd` 的自动段落由它生成） |
+| **必须新机器重新生成** | `%LOCALAPPDATA%\workbuddy_auto_checkin\state.json`、`last_account.txt`、`refresh.log` | 去重状态、上次账号和日志，属于本机状态。`state.json` 尤其不要拷——它按 `expiresAt` 去重且不区分仓库，拷过去可能让新机误判「已推送过」而跳过写入；`last_account.txt` 只是提示行用的镜像，新机跑一次就会自己生成 |
 | **绝对不能复制** | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` | 这是旧机、旧账号的登录态。新机必须自己登录客户端生成 |
 | **不能复制** | `%APPDATA%\GitHub CLI\hosts.yml` | gh 的登录凭据，新机自己 `gh auth login` |
 | **不能复制** | `.git`、`__pycache__`、`build/`、`dist/` | 版本库与构建产物，新机重新 clone / 重新生成 |
@@ -151,9 +151,17 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1
 
 > **注意**：WorkBuddy 客户端每次启动都会轮换 `accessToken`，旧令牌立即作废。
 > 登录那次只覆盖开机场景；**中途关掉又打开客户端后，点一下桌面快捷方式**即可。
-> 快捷方式调用 `scripts\sync_now.cmd`，里面**不写死账号**：双击后先问「本机账号 id」
-> （回车沿用上次，输入 `-` 表示单账号模式），再跑 `refresh_token.py --ask-account --wait 60`；
-> 没有控制台时不会提问，直接用上次的值。换账号 / 多账号共用一台机器时都不必重新生成。
+> 快捷方式和登录启动共用同一个 `scripts\run_refresh.cmd`，靠参数分模式：
+>
+> | 调用 | 用途 | 行为 |
+> | --- | --- | --- |
+> | `run_refresh.cmd` | 桌面快捷方式（手动） | 先问「本机账号 id」（提示行写出上次的账号，回车沿用；`-` 单账号；输入 id 则直接用它），再跑 `refresh_token.py`；结束停窗 8 秒 |
+> | `run_refresh.cmd --auto` | `WorkBuddyTokenRefresh.vbs`（登录/轮询） | 无窗口、无提问，账号与 `--wait` 来自 `setup_task.ps1` 的参数；`-Uninstall` 会把这段自动段落摘掉 |
+>
+> 手动模式**不写死账号**，换账号 / 多账号共用一台机器都不必重新生成；账号提问只能在 `.cmd` 层用
+> `set /p` 做——`pyw` 没有标准输入，`--ask-account` 在无控制台时只会沿用上次的值。
+> 提示行里的「上次账号」读的是 `%LOCALAPPDATA%\workbuddy_auto_checkin\last_account.txt`
+> （`refresh_token.py` 每次跑完写一行：账号 id，或 `-` 表示单账号模式）。
 
 > 新机器上如果路径/用户名含中文也没关系：`.cmd` 只用 `%~dp0` 与 `%LOCALAPPDATA%` 运行时展开。
 
