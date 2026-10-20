@@ -27,7 +27,8 @@ permissions:
 jobs:
   # ---------------------------------------------------------------- 账号清单
   # 仓库变量 WB_ACCOUNTS（注意是 Variables 不是 Secrets）决定要跑几个账号：
-  #   [{"id":"MAIN","label":"主号"},{"id":"WORK","label":"工作号"}]
+  #   [{"id":"MAIN","label":"主号"},{"id":"WORK","label":"工作号","host":"我的游戏本"}]
+  # host 可选，只用于失败提示（该账号在哪台机器登录）。
   # 不设置该变量时，按单账号模式跑（沿用旧的 WB_ACCESS_TOKEN）。
   prepare:
     runs-on: ubuntu-latest
@@ -75,12 +76,15 @@ jobs:
                   fail("第 %d 项的 id 非法：只允许 A-Z 0-9 _，1~32 位" % (i + 1))
               label = str(item.get("label") or aid).replace("\r", " ").replace("\n", " ").strip()
               secret = str(item.get("secret") or "").strip()
+              # host：该账号登录在哪台机器，只出现在失败卡片的提示里，
+              # 多机器分工时省得靠猜「该去哪台机器同步」
+              host = str(item.get("host") or "").replace("\r", " ").replace("\n", " ").strip()
               # 默认取 WB_ACCESS_TOKEN_<ID>；MAIN 兼容单账号时期的旧名字
               if not secret:
                   secret = "WB_ACCESS_TOKEN" if aid == "MAIN" else "WB_ACCESS_TOKEN_" + aid
               # webhook 名在这里算好，工作流里就只剩 secrets[matrix.webhook] 这种
               # 纯属性访问，不必在索引表达式里套 format()
-              accounts.append({"id": aid, "label": label or aid,
+              accounts.append({"id": aid, "label": label or aid, "host": host,
                                "secret": secret, "webhook": "FEISHU_WEBHOOK_" + aid})
 
           ids = [a["id"] for a in accounts]
@@ -136,7 +140,9 @@ jobs:
           FEISHU_WEBHOOK: ${{ secrets[matrix.webhook] || secrets.FEISHU_WEBHOOK }}
           WB_ACCOUNT: ${{ matrix.id }}
           WB_ACCOUNT_LABEL: ${{ matrix.label }}
+          WB_ACCOUNT_HOST: ${{ matrix.host }}
           WB_TOKEN_SECRET: ${{ matrix.secret }}
+          WB_REPO: ${{ github.repository }}
           WB_ENDPOINT: https://copilot.tencent.com
           WB_RESULT_FILE: ${{ runner.temp }}/wb_result_${{ matrix.id }}.md
         run: |
@@ -162,12 +168,16 @@ jobs:
           ACCOUNT_ID: ${{ matrix.id }}
           ACCOUNT_LABEL: ${{ matrix.label }}
           ACCOUNT_SECRET: ${{ matrix.secret }}
+          ACCOUNT_HOST: ${{ matrix.host }}
         run: |
           set -uo pipefail
           {
             echo "### Buddy 加油站每日自动化 · $ACCOUNT_LABEL"
             echo ""
             echo "- 账号：$ACCOUNT_ID（Secret $ACCOUNT_SECRET）"
+            if [ -n "$ACCOUNT_HOST" ]; then
+              echo "- 令牌同步机器：$ACCOUNT_HOST（本机登录该账号时在该机器上跑同步）"
+            fi
             echo "- 运行时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')（cron 为 UTC）"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -f "$RESULT_FILE" ]; then

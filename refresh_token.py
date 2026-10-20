@@ -21,6 +21,13 @@
     --ask-account 会当场问你要同步哪个账号（回车沿用上次用的），
     省得把某台机器的 id 写死在 .cmd 里。
 
+    出问题时先诊断（只读，绝不解密、绝不写入）：
+        python refresh_token.py --gh-repo OWNER/REPO --account LINJJ --status
+    把三处数据摆在一起：本机凭据（到期时间、登录身份指纹）、本机 state.json 的
+    推送记录、远端 Secret 的最后更新时间。远端比本机记录新 → 有人在脚本之外改过，
+    本机闸门看不见，此时记录不可信；身份指纹和该 Secret 历史上的写入者不一致 →
+    串号（把 A 的令牌推到 B 的 Secret，B 会一直 401，看起来却像令牌过期）。
+
     可选参数：
       --account ID   把令牌写入 WB_ACCESS_TOKEN_ID（多账号时用来区分）。
                      只允许 A-Z 0-9 _，会统一转成大写。
@@ -29,17 +36,24 @@
                      （默认 3）。有记录时按「谁更新用谁」比较，不看剩余天数。
       --wait SEC     打开客户端后立刻运行时，最多等 SEC 秒直到凭据换新。
       --check        只检查新鲜度，不做任何写入。
-      --force        忽略新鲜度判断，强制推送。
+      --status       只读诊断（见上），比 --check 多看远端元数据与身份指纹。
+      --expect-identity FP|ask
+                     凭据里没有可用身份字段时的兜底确认：FP 与本机身份指纹比对，
+                     ask 在有控制台时打印脱敏身份要求回车确认（静默模式不阻塞）。
+      --force        忽略新鲜度与身份判断，强制推送。
       --log PATH     输出追加到日志文件（供静默运行使用，日志中绝不含 token）。
 
-    退出码：0 成功/无需推送；3 令牌不新鲜已跳过；4 令牌已过期；1 其他错误。
+    退出码：0 成功/无需推送；3 令牌不新鲜已跳过；4 令牌已过期；
+           5 疑似串号（本机登录的账号不是这个 Secret 的账号）；1 其他错误。
 
-（打包成 refresh_token.exe 后用法相同，双击运行等价于无参数形式）
+（打包成 refresh_token.exe 后用法相同，双击运行等价于无参数形式；
+ --status / --expect-identity 只存在于 .py，exe 里没有）
 
 安全约定：
   - 明文 token 只出现在本进程内存与最终那一次目标位置；
   - 命令行参数、环境变量、日志均不含明文 token；
-  - 不写临时 token 文件（状态文件只记录过期时间戳与 12 位指纹，不含 token）。
+  - 不写临时 token 文件（状态文件只记录过期时间戳、12 位令牌指纹与 12 位身份指纹，
+    不含 token，也不含任何身份明文）。
 """
 
 import base64
@@ -63,10 +77,16 @@ POLL_INTERVAL = 5.0           # --wait 期间轮询凭据文件的间隔
 FRESH_WINDOW = 120.0          # 凭据文件在这个秒数内被写过，才认为客户端正在刷新，值得等待
 DEFAULT_SECRET = "WB_ACCESS_TOKEN"   # 单账号 / 主号用的 Secret 名
 ACCOUNT_RE = re.compile(r"[A-Z0-9_]{1,32}")
+# 身份白名单：凭据里可能用来区分「登录的是哪个账号」的稳定 id 字段名。
+# 只用于算指纹，绝不打印原值；字段名不保证跨版本存在，取不到就不判定串号。
+IDENTITY_KEYS = frozenset(("uid", "userid", "openid", "unionid", "uin",
+                           "accountid", "staffid", "externaluserid"))
+REMOTE_TOLERANCE = 180.0   # 远端 updatedAt 比本机 pushed_at 新这么多秒以内视作同一次写入
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_STALE = 3                # 令牌不新鲜，主动跳过（不是错误，不改写 Secret）
 EXIT_EXPIRED = 4              # 令牌已过期
+EXIT_IDENTITY = 5             # 疑似串号：本机登录账号与该 Secret 的账号不符
 
 
 # 固定代码只出现在 argv；加密信封走 stdin，构建材料不出本进程。
@@ -386,13 +406,15 @@ def install_log(path):
 
 def parse_args(argv):
     opts = {"gh_repo": None, "min_days": DEFAULT_MIN_DAYS, "check": False,
+            "status": False, "expect_identity": "",
             "force": False, "log": None, "wait": 0.0, "account": "",
             "ask_account": False}
     numeric = {"--min-days": "min_days", "--wait": "wait"}
+    valued = {"--gh-repo", "--log", "--account", "--expect-identity"} | set(numeric)
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in ("--gh-repo", "--log", "--account") or arg in numeric:
+        if arg in valued:
             if i + 1 >= len(argv):
                 raise SystemExit("参数 %s 缺少取值" % arg)
             value = argv[i + 1]
@@ -403,6 +425,8 @@ def parse_args(argv):
                 opts["log"] = value
             elif arg == "--account":
                 opts["account"] = normalize_account(value)
+            elif arg == "--expect-identity":
+                opts["expect_identity"] = value.strip().lower()
             else:
                 try:
                     num = float(value)
@@ -414,13 +438,16 @@ def parse_args(argv):
             continue
         if arg == "--check":
             opts["check"] = True
+        elif arg == "--status":
+            opts["status"] = True
         elif arg == "--force":
             opts["force"] = True
         elif arg == "--ask-account":
             opts["ask_account"] = True
         else:
             raise SystemExit(
-                "未知参数：%s（可用：--gh-repo --account --ask-account --min-days --wait --check --force --log）" % arg)
+                "未知参数：%s（可用：--gh-repo --account --ask-account --min-days --wait "
+                "--check --status --expect-identity --force --log）" % arg)
         i += 1
     return opts
 
@@ -465,6 +492,8 @@ def pushed_expiry(secret):
     """该 Secret 上次推送的令牌过期时刻；没有记录返回 None。
 
     多账号时按 Secret 名分开记，否则两个账号会互相把对方判成「已推送」。
+    只认本机记录：远端被脚本之外改过（见 status_report）也不在这里参与判断，
+    否则「远端看起来更新」会让闸门跳过本该发生的推送 —— 那正是死令牌的成因。
     """
     state = read_state()
     pushed = state.get("pushed")
@@ -493,6 +522,240 @@ def known_accounts():
             if name.startswith(DEFAULT_SECRET + "_"):
                 found.add(name[len(DEFAULT_SECRET) + 1:])
     return sorted(found)
+
+
+def pushed_entry(secret):
+    """state.json 里该 Secret 的整条记录；没有则返回空 dict（旧格式也当没有）。"""
+    pushed = read_state().get("pushed")
+    if isinstance(pushed, dict) and isinstance(pushed.get(secret), dict):
+        return pushed[secret]
+    return {}
+
+
+def pushed_at_epoch(entry):
+    """把记录里的 pushed_at（本机 naive 时间）换成 epoch，供与远端时间比较。"""
+    text = entry.get("pushed_at") if isinstance(entry, dict) else None
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def iso_utc_to_epoch(text):
+    """GitHub 返回的 updatedAt 是 UTC 秒级；换成本机 epoch 才能和 pushed_at 比。"""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        stamp = datetime.datetime.strptime(text.strip(), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return stamp.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def remote_secrets(repo):
+    """列出仓库 Secret 的「名称 + 更新时间」元数据（该接口不返回明文值）。
+
+    失败一律返回 None 走降级：诊断读不到远端，不该挡住正常推送。
+    WB_STATUS_FIXTURE 指向一份 gh 输出格式的 JSON，供离线测试比对逻辑。
+    """
+    fixture = os.environ.get("WB_STATUS_FIXTURE")
+    if fixture:
+        try:
+            with open(fixture, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            print("[远端] 夹具读取失败：%s" % e)
+            return None
+    else:
+        if not repo or shutil.which("gh") is None:
+            return None
+        try:
+            proc = subprocess.run(
+                ["gh", "secret", "list", "--repo", repo, "--json", "name,updatedAt"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            sys.stderr.write("[远端] 读取失败（不影响推送，只做本地比对）：%s\n"
+                             % proc.stderr.decode("utf-8", "replace").strip()[:200])
+            return None
+        try:
+            data = json.loads(proc.stdout.decode("utf-8", "replace"))
+        except ValueError:
+            return None
+    items = data if isinstance(data, list) else []
+    return {str(x["name"]): str(x.get("updatedAt") or "")
+            for x in items if isinstance(x, dict) and x.get("name")}
+
+
+def session_identity(session):
+    """算出本机登录账号的身份指纹（sha256 前 12 位），并给出字段名明细。
+
+    身份字段名不保证跨版本存在，所以按白名单扫描明文 dict；一个都取不到就返回
+    None，调用方降级成「不判定串号」，绝不因此挡住正常推送。原值绝不外泄。
+    """
+    parts = {}
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            name = str(key)
+            if isinstance(value, dict):
+                walk(value)
+            elif (name.lower() in IDENTITY_KEYS
+                  and isinstance(value, (str, int)) and not isinstance(value, bool)):
+                parts.setdefault(name.lower(),
+                                 hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12])
+
+    walk(session)
+    if not parts:
+        return None, ""
+    joined = ",".join("%s=%s" % (k, parts[k]) for k in sorted(parts))
+    return (hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12],
+            "、".join("%s:%s" % (k, parts[k][:6]) for k in sorted(parts)))
+
+
+def check_identity(secret, idf, force, expect=""):
+    """防串号：一台机器只登录一个 WorkBuddy 账号，把 A 的令牌推到 B 的 Secret，
+    B 只会一直 401，而且现象和「令牌过期」一模一样，很难查。
+
+    放行条件：本机取不到身份字段、该 Secret 还没记过身份、身份一致，或 --force。
+    """
+    if expect and expect != "ask":
+        wanted = expect.strip().lower()
+        if idf is None:
+            print("[身份] 凭据里没有可用身份字段，无法与 --expect-identity 比对")
+        elif wanted != idf:
+            print("[串号] 本机登录身份 %s ≠ --expect-identity 要求的 %s" % (idf, wanted))
+            print("       这台机器登录的不是那个账号。切换登录后再同步，或确认无误加 --force。")
+            if not force:
+                return EXIT_IDENTITY
+    if idf is None:
+        print("[身份] 凭据里没有可用的身份字段，跳过串号检查"
+              "（需要人工确认时用 --expect-identity ask）")
+        return None
+    recorded = pushed_entry(secret).get("idf")
+    if not isinstance(recorded, str) or not recorded:
+        return None
+    if recorded == idf:
+        return None
+    print("[串号] 本机登录身份 %s，但 Secret %s 上次是由身份 %s 推送的" % (idf, secret, recorded))
+    print("       多机器各管一个账号时，这通常意味着你在这台机器上填了别人的账号 id。")
+    print("       处理：切到该账号登录 WorkBuddy 再同步；确实要用本机令牌覆盖则加 --force。")
+    return None if force else EXIT_IDENTITY
+
+
+def confirm_identity(secret, idf, expect):
+    """--expect-identity ask：身份字段不可用时的兜底，靠人确认。
+
+    静默模式（计划任务 / --auto / stdin 被重定向）不阻塞，只提示。
+    """
+    if expect != "ask":
+        return None
+    tip = "本机登录身份 %s，即将写入 Secret %s" % (idf or "未知（凭据无身份字段）", secret)
+    if not (getattr(sys.stdin, "isatty", None) and sys.stdin.isatty()):
+        print("[身份] 无控制台，跳过人工确认：%s" % tip)
+        return None
+    try:
+        input("%s\n回车确认是本账号，Ctrl+C 放弃：" % tip)
+    except (EOFError, KeyboardInterrupt):
+        print("已取消，未写入 Secret")
+        return EXIT_IDENTITY
+    return None
+
+
+def status_report(repo, secret, account, session, auth_file):
+    """--status：把本机凭据 / 本机记录 / 远端 Secret 三处摆在一起，只读。"""
+    entry = pushed_entry(secret)
+    expires_at = token_expiry(session)
+    idf, id_detail = session_identity(session)
+    remote = remote_secrets(repo) if repo else None
+    # None = 读不到远端；True/False = 远端到底有没有这个 Secret。
+    # 结论段要用它区分「本机没记录所以该推」和「本机没记录但远端有 → 别的机器在管」
+    remote_has_secret = None
+
+    print("—— 诊断（只读，不解密、不写入）——")
+    print("仓库：%s" % (repo or "未指定（缺 --gh-repo，跳过远端比对）"))
+    print("凭据文件：%s" % auth_file)
+    print("目标 Secret：%s%s" % (secret, "（账号 %s）" % account if account else ""))
+    print("本机身份：%s" % ("fp=%s（取自 %s）" % (idf, id_detail) if idf
+                            else "凭据里没有可用的身份字段"))
+    if expires_at is None:
+        print("本机令牌：凭据未给出到期时间，无法判断新鲜度")
+    else:
+        left = (expires_at - time.time()) / 86400.0
+        print("本机令牌：到期 %s（%s）" % (fmt_time(expires_at),
+              "已过期 %.1f 天" % abs(left) if left <= 0 else "还剩 %.1f 天" % left))
+
+    recorded = entry.get("expires_at")
+    print("本机记录：%s" % (
+        "无（这台机器从未推送过该 Secret）" if not entry else
+        "推送于 %s，令牌 %s 到期，指纹 %s，身份 %s"
+        % (entry.get("pushed_at") or "?", fmt_time(recorded) if isinstance(recorded, (int, float)) else "?",
+           entry.get("fp") or "?", entry.get("idf") or "?")))
+
+    if not repo:
+        pass
+    elif remote is None:
+        print("远端 Secret：读不到（未装 gh、网络/代理受限或仓库无权限），本次只做本地比对")
+    else:
+        updated = remote.get(secret)
+        remote_has_secret = updated is not None
+        if updated is None:
+            print("远端 Secret：不存在（从未创建，或已被删除）")
+            if entry:
+                print("           ⚠ 本机却有推送记录 → 令牌缺失会让 Actions 静默不推卡片，"
+                      "看起来像「没跑」，请加 --force 重推。")
+        else:
+            print("远端 Secret：最后更新 %s（UTC）" % updated)
+            r_ep, l_ep = iso_utc_to_epoch(updated), pushed_at_epoch(entry)
+            if r_ep is not None and l_ep is None:
+                print("           本机没有可比对的推送时间，无法判断是否被外部改过")
+            elif r_ep is not None and r_ep - l_ep > REMOTE_TOLERANCE:
+                print("           ⚠ 比本机记录新 %d 分钟 → 有人在脚本之外改过这个 Secret"
+                      "（另一台机器同步过则属正常）。本机闸门看不见这次写入，"
+                      "记录不可信：确认后用 --force 重推一次让两边对齐。"
+                      % round((r_ep - l_ep) / 60.0))
+            elif r_ep is not None:
+                print("           与本机记录一致（差 %.0f 秒）" % (r_ep - l_ep))
+            if isinstance(entry.get("idf"), str) and idf and entry["idf"] != idf:
+                print("           ⚠ 串号：该 Secret 由身份 %s 写入，本机身份是 %s。"
+                      "这台机器不该负责它。" % (entry["idf"], idf))
+        others = sorted(n[len(DEFAULT_SECRET) + 1:] for n in remote
+                        if n.startswith(DEFAULT_SECRET + "_"))
+        local_known = known_accounts()
+        strangers = [x for x in others if x not in local_known]
+        if others:
+            print("远端令牌类账号：%s" % "、".join(others))
+        if strangers:
+            print("           其中 %s 本机从未同步过 → 别在这台机器 --account %s，"
+                  "去登录该账号的那台机器同步。" % ("、".join(strangers), strangers[0]))
+        missing = [x for x in local_known if x not in others]
+        if missing:
+            print("           本机同步过但远端没有：%s（Secret 可能被删了）" % "、".join(missing))
+
+    if expires_at is None:
+        print("结论：凭据没有到期时间，请打开 WorkBuddy 让它重写凭据后再看")
+    elif expires_at <= time.time():
+        print("结论：令牌已过期 → 打开 WorkBuddy 客户端（它会自动续期），再跑本脚本")
+    elif not isinstance(recorded, (int, float)):
+        if remote_has_secret:
+            print("结论：这台机器从未推送过 %s，但远端已经有它 → 多半是另一台机器在管这个账号，"
+                  "在这台机器推只会把自己的令牌写进去（串号）。去登录该账号的那台机器跑 --status；"
+                  "确认这台机器确实该管它，再 --force 覆盖一次。" % secret)
+        elif remote_has_secret is False:
+            print("结论：本机没有推送记录，远端也还没有这个 Secret → "
+                  "Actions 会报缺令牌；由登录该账号的机器跑一次本脚本创建它（首次推送会记下身份指纹）")
+        else:
+            print("结论：本机没有推送记录 → 直接跑本脚本推送（首次推送会记下身份指纹，供日后查串号）")
+    elif expires_at > recorded + 1:
+        print("结论：客户端已轮换，本机令牌比 Secret 里的新 → 立刻重推，否则 Actions 一定 401")
+    else:
+        print("结论：本机令牌不比记录里的新 → 不要重复推送；想强制对齐记录用 --force")
+    return EXIT_OK
 
 
 def ask_account():
@@ -576,8 +839,11 @@ def remember_account(account):
         pass
 
 
-def write_state(secret, expires_at, fingerprint=""):
-    """只记录「已推送令牌的过期时刻 + 指纹」，不含任何凭据内容。"""
+def write_state(secret, expires_at, fingerprint="", identity_fp=""):
+    """只记录「已推送令牌的过期时刻 + 指纹 + 本机身份指纹」，不含任何凭据内容。
+
+    身份指纹用来查串号（A 的令牌被推到 B 的 Secret），只存哈希，不存身份明文。
+    """
     state = read_state()
     pushed = state.get("pushed")
     if not isinstance(pushed, dict):
@@ -586,6 +852,8 @@ def write_state(secret, expires_at, fingerprint=""):
              "pushed_at": datetime.datetime.now().isoformat(timespec="seconds")}
     if fingerprint:
         entry["fp"] = fingerprint
+    if identity_fp:
+        entry["idf"] = identity_fp
     pushed[secret] = entry
     state["pushed"] = pushed
     state.pop("pushed_expires_at", None)     # 旧格式字段，迁移后不再需要
@@ -639,9 +907,18 @@ def main():
     opts = parse_args(sys.argv[1:])
     if opts["ask_account"] and not opts["account"]:
         opts["account"] = ask_account()
+    secret = secret_name(opts["account"])
+
+    # 诊断模式完全只读：连「上次用的账号」都不落盘，免得看个状态改变行为
+    if opts["status"]:
+        auth_file = find_auth_file()
+        if not auth_file:
+            raise SystemExit("未找到凭据文件，请设置 WORKBUDDY_AUTH_FILE")
+        return status_report(opts["gh_repo"], secret, opts["account"],
+                             load_session(auth_file), auth_file)
+
     if opts["account"]:
         remember_account(opts["account"])
-    secret = secret_name(opts["account"])
     log_path, _ = install_log(opts["log"])
     if log_path:
         print("日志：%s" % log_path)
@@ -655,6 +932,15 @@ def main():
     session = load_session(auth_file)
     if opts["wait"] > 0:
         session = wait_for_refresh(auth_file, session, opts["wait"], secret)
+
+    # ---- 串号闸门：先确认本机登录的就是要同步的那个账号 ----
+    idf, _ = session_identity(session)
+    code = check_identity(secret, idf, opts["force"], opts["expect_identity"])
+    if code:
+        return code
+    code = confirm_identity(secret, idf, opts["expect_identity"])
+    if code:
+        return code
 
     # ---- 新鲜度闸门：宁可不写，也不能把坏令牌覆盖进 Secret ----
     # 关键背景：客户端每次启动都会轮换 accessToken，旧令牌立即失效。
@@ -727,8 +1013,10 @@ def main():
         )
         if proc.returncode != 0:
             raise SystemExit("写入 GitHub Secret 失败：" + proc.stderr.decode("utf-8", "replace"))
-        write_state(secret, expires_at, fingerprint)
-        print("已写入 GitHub Secret %s（仓库 %s，令牌指纹 %s）" % (secret, opts["gh_repo"], fingerprint))
+        write_state(secret, expires_at, fingerprint, idf)
+        print("已写入 GitHub Secret %s（仓库 %s，令牌指纹 %s%s）"
+              % (secret, opts["gh_repo"], fingerprint,
+                 "，身份指纹 %s" % idf if idf else ""))
         return EXIT_OK
 
     if opts["gh_repo"]:

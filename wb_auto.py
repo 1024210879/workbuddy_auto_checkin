@@ -16,7 +16,9 @@
     WB_ACCESS_TOKEN    该账号的令牌（值为空即视为未配置，退出码 2）
     WB_ACCOUNT         账号 id（如 MAIN / WORK），只用于日志与排错
     WB_ACCOUNT_LABEL   账号显示名，进飞书卡片标题与 step summary
-    WB_TOKEN_SECRET    该账号对应的 Secret 名，仅用于缺失令牌时的提示文案
+    WB_TOKEN_SECRET    该账号对应的 Secret 名，用于缺失/失效时的提示文案
+    WB_REPO            仓库名，出现在提示的同步命令里（缺省显示 OWNER/REPO）
+    WB_ACCOUNT_HOST    该账号登录在哪台机器（WB_ACCOUNTS 里可选的 host 字段）
 """
 
 import json
@@ -141,7 +143,8 @@ def run_checkin(headers, endpoint):
     if scode == CODE_NO_NETWORK:
         return False, {"result": "NETWORK", "report": "网络不可达，签到未完成"}
     if scode in (401, 403):
-        return False, {"result": "AUTH", "report": "认证被拒（HTTP %s），令牌已失效：本机打开 WorkBuddy 后点一下桌面「同步 WorkBuddy 令牌」" % scode}
+        # 修法不在这里写死：卡片末尾的「下一步」会带上账号 / Secret / 负责的机器
+        return False, {"result": "AUTH", "report": "认证被拒（HTTP %s），令牌已失效" % scode}
     if not (200 <= scode < 300):
         return False, {"result": "ERROR", "report": "状态接口异常（HTTP %s）" % scode}
 
@@ -301,7 +304,7 @@ def run_buddy(headers, endpoint):
 
 # ---------------------------------------------------------------- 飞书
 
-def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
+def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok, extra_lines=None):
     """推送到飞书自定义机器人。签到与猫猫状态分开成行。"""
     color = "green" if overall_ok else "red"
     lines = [
@@ -313,6 +316,8 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
         "**猫猫旅行**",
         buddy_line,
     ]
+    if extra_lines:
+        lines += ["", "**下一步**"] + list(extra_lines)
     payload = {
         "msg_type": "interactive",
         "card": {
@@ -341,15 +346,43 @@ def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
 
 # ---------------------------------------------------------------- 主流程
 
-def _token_hint(secret_name, account):
-    """令牌为空时，给出与 Secret 名对得上的本机命令。"""
-    suffix = ""
-    if secret_name.startswith("WB_ACCESS_TOKEN_") and len(secret_name) > len("WB_ACCESS_TOKEN_"):
-        suffix = " --account %s" % secret_name[len("WB_ACCESS_TOKEN_"):]
-    elif secret_name not in ("", "WB_ACCESS_TOKEN"):
-        # 自定义 Secret 名：脚本推不出映射关系，直接说明要去网页填
-        return "（该 Secret 名不是脚本默认规则，请在仓库 Settings → Secrets 里手工填入）"
-    return "（在本机运行：python refresh_token.py --gh-repo OWNER/REPO%s）" % suffix
+def account_suffix(secret_name, account):
+    """从 Secret 名反推 --account 参数；自定义名反推不出来时返回 None。"""
+    prefix = "WB_ACCESS_TOKEN_"
+    if secret_name.startswith(prefix) and len(secret_name) > len(prefix):
+        return " --account %s" % secret_name[len(prefix):]
+    if secret_name in ("", "WB_ACCESS_TOKEN"):
+        return ""
+    return None
+
+
+def auth_advice(ctx, reason):
+    """令牌出问题时，给一段能在「正确的那台机器」上照着做的指令。
+
+    多账号跨机器时，只说「本机同步一下」等于让人猜：卡片必须点名账号、
+    Secret 名、负责的机器，并给出诊断入口（--status 能区分过期/被外部改过/串号）。
+    reason ∈ {"MISSING", "AUTH"}。返回若干行卡片文案。
+    """
+    secret = ctx["secret"] or "WB_ACCESS_TOKEN"
+    suffix = account_suffix(secret, ctx["account"])
+    if suffix is None:
+        return ["Secret：%s（该名字不是脚本默认规则，请在仓库 Settings → Secrets 里手工填）" % secret]
+
+    if reason == "MISSING":
+        head = "原因：Secret %s 没有值 —— 这台账号从未同步过，或 Secret 被删了。" % secret
+    else:
+        head = ("原因：Secret %s 里的令牌已失效 —— WorkBuddy 每次启动都会轮换令牌，"
+                "旧的立即作废，本机推送落后于轮换就会 401。" % secret)
+    where = ("请在【%s】上操作" % ctx["host"] if ctx["host"]
+             else "请在登录该账号的那台机器上操作（客户端登录态只在那台机器上）")
+    repo = ctx["repo"] or "OWNER/REPO"
+    cmd = "python refresh_token.py --gh-repo %s%s --wait 60" % (repo, suffix)
+    return [head,
+            where,
+            "① 打开 WorkBuddy 客户端（它会自动续期令牌）",
+            "② 先诊断：`--status%s`" % (" --account %s" % ctx["account"] if ctx["account"] else ""),
+            "③ 再同步：`%s`" % cmd,
+            "（若 --status 提示「串号」，说明这台机器登录的不是这个账号，别在这台机器推）"]
 
 
 def main():
@@ -359,6 +392,9 @@ def main():
     account = (os.environ.get("WB_ACCOUNT") or "").strip()
     label = (os.environ.get("WB_ACCOUNT_LABEL") or "").strip() or account
     secret_name = (os.environ.get("WB_TOKEN_SECRET") or "").strip()
+    ctx = {"account": account, "label": label, "secret": secret_name,
+           "repo": (os.environ.get("WB_REPO") or "").strip(),
+           "host": (os.environ.get("WB_ACCOUNT_HOST") or "").strip()}
 
     if label:
         log("=== 账号：%s%s ===" % (label, "（%s）" % account if account and account != label else ""))
@@ -367,7 +403,13 @@ def main():
         detail = "缺少环境变量 WB_ACCESS_TOKEN"
         if secret_name:
             detail = "Secret %s 没有值" % secret_name
-        log(detail + _token_hint(secret_name, account))
+        log(detail)
+        advice = auth_advice(ctx, "MISSING")
+        for line in advice:
+            log("  " + line)
+        if webhook:
+            push_feishu(webhook, label or "每日自动化",
+                        "❌ " + advice[0], "🐱 未执行（令牌缺失）", False, advice[1:])
         return 2
     if not webhook:
         log("缺少环境变量 FEISHU_WEBHOOK")
@@ -391,6 +433,13 @@ def main():
         buddy = {"result": "ERROR", "report": "猫猫模块异常（%s: %s）" % (type(e).__name__, e)}
     log("  结论：%s" % buddy.get("report", ""))
 
+    # 令牌被拒时，卡片要点名账号 / Secret / 负责的机器：多账号跨机器时靠猜没法修
+    advice = []
+    if checkin.get("result") == "AUTH" or buddy.get("result") == "AUTH":
+        advice = auth_advice(ctx, "AUTH")
+        for line in advice:
+            log("  " + line)
+
     # 整体成败只看签到：签到成功即成功
     overall_ok = checkin_ok
     checkin_line = ("✅ " if checkin_ok else "❌ ") + checkin["report"]
@@ -398,7 +447,7 @@ def main():
 
     title = label or "每日自动化"
     if webhook:
-        push_feishu(webhook, title, checkin_line, buddy_line, overall_ok)
+        push_feishu(webhook, title, checkin_line, buddy_line, overall_ok, advice)
 
     result = {
         "account": {"id": account, "label": label},
@@ -406,6 +455,8 @@ def main():
         "buddy": {k: v for k, v in buddy.items() if k != "notes"},
         "overall_ok": overall_ok,
     }
+    if advice:
+        result["advice"] = advice
     print("RESULT_JSON " + json.dumps(result, ensure_ascii=False))
 
     # 结果文件只含结论文案，不含 token，供 Actions 写入 step summary

@@ -198,12 +198,37 @@ python refresh_token.py --gh-repo 1024210879/workbuddy_auto_checkin --account WO
 powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1 -Repo 1024210879/workbuddy_auto_checkin -Account WORK
 ```
 
+### 两台机器分工时，出问题先跑 `--status`
+
+多台机器各管一个账号，最容易撞上的两件事都不是「令牌过期」，但现象都是 401：
+
+```text
+# 只读诊断：不解密、不写入，把三处数据摆在一起
+python refresh_token.py --gh-repo 1024210879/workbuddy_auto_checkin --account WORK --status
+```
+
+| 提示 | 实际发生了什么 | 怎么办 |
+| --- | --- | --- |
+| `比本机记录新 N 分钟 → 有人在脚本之外改过` | 有人在网页上手工粘贴、或另一台机器推过一次，本机 `state.json` 看不见这次写入，闸门就会误判「不用重推」 | 确认来源后 `--force` 重推一次，让本机记录与远端对齐 |
+| `[串号] 本机登录身份 …，但该 Secret 上次由身份 … 推送`（exit 5） | 这台机器登录的不是那个账号，把 A 的令牌推到 `WB_ACCESS_TOKEN_B`，B 会一直 401 | 去登录该账号的那台机器同步；确实要覆盖再 `--force` |
+| 结论「这台机器从未推送过 X，但远端已经有它 → 多半是另一台机器在管」 | 本机 `state.json` 没有 X 的记录，远端却已有 `WB_ACCESS_TOKEN_X`——通常是另一台机器在负责它，或有人在网页上手工粘过 | 别在这台机器推（推了就是串号）；到 X 登录的那台机器跑 `--status` |
+| `其中 MAOXY 本机从未同步过` | 远端有这个账号的 Secret，但这台机器从没推过它 | 别在这台机器 `--account` 它 |
+
+首次推送时脚本会把「本机登录身份」的哈希（12 位，不含任何身份明文）记进 `state.json` 的 `idf`，之后每次同步都对不上就报错。凭据里没有可用的身份字段时不判定，只提示——这时用 `--expect-identity ask` 人工确认。
+
+顺便把机器名也写进账号清单，失败卡片就会直接点名该去哪台机器操作（`host` 可选，不填不影响任何行为）：
+
+```text
+[{"id":"MAIN","label":"主号","host":"办公机"},{"id":"WORK","label":"工作号","host":"游戏本"}]
+```
+
 ### 加号前后会变什么
 
 - **执行方式**：workflow 先读 `WB_ACCOUNTS`，再按账号矩阵**并行**跑；每个账号一个 job，日志、step summary 分开，`fail-fast: false` 保证互不牵连
 - **飞书卡片标题**变成 `Buddy 加油站 · 工作号 · 成功`，多个账号的卡片混在一个群里也分得清
 - **并发控制**：同一账号的多个时段仍然串行（`wb-daily-<ID>`），不同账号之间互不阻塞
-- **令牌缺失不会串号**：某个账号的 Secret 没配，那个 job 直接报「Secret `WB_ACCESS_TOKEN_WORK` 没有值」并退出，不会偷偷用别的账号的令牌
+- **令牌缺失不会串号**：某个账号的 Secret 没配，那个 job 直接报「Secret `WB_ACCESS_TOKEN_WORK` 没有值」并退出（现在也会推一张卡片说明是哪一个），不会偷偷用别的账号的令牌
+- **本机侧也会挡串号**：把 A 的令牌推到 `WB_ACCESS_TOKEN_B` 时，`refresh_token.py` 用身份指纹对不上就直接 exit 5（详见上一节）
 
 ### 几个容易踩的点
 
@@ -334,6 +359,7 @@ Account id [Enter = LINJJ, - = single-account mode]:
 | 本机令牌不比记录里的新 | 跳过，省一次 API 调用 | 0 |
 | 没有推送记录，且剩余 < `--min-days`（默认 3 天） | **跳过，不动 Secret** | 3 |
 | 已经过期 | **跳过，不动 Secret**，提示先启动客户端 | 4 |
+| 本机登录的身份，与该 Secret 上次记录的推送身份不一致（串号） | **不推送**，提示切到正确账号或 `--force` 覆盖 | 5 |
 
 本地只在 `%LOCALAPPDATA%\workbuddy_auto_checkin\state.json` 里按 Secret 名分别记「已推送令牌的过期时刻 + 12 位指纹」，不含任何凭据。多账号时各记各的，不会互相把对方判成「已推送」。日志里也不会出现明文 token。
 
@@ -341,6 +367,7 @@ Account id [Enter = LINJJ, - = single-account mode]:
 
 > `setup_task.ps1` 通过 `pythonw`/`pyw` 静默运行，不会弹黑窗口；日志在 `%LOCALAPPDATA%\workbuddy_auto_checkin\refresh.log`。
 > 仓库里的 `refresh_token.exe` 是在本次改动之前打包的，不含新逻辑；如果你用 exe 手动刷新，建议改用 `python refresh_token.py`（或重新打包）。
+> 具体说，`--status` 与 `--expect-identity` 两个参数**只存在于 `refresh_token.py`**，exe 里传会直接报「未知参数」。要做诊断或排查串号，请用 `py -3 refresh_token.py --status ...`。
 
 ### 不想装 gh 的替代做法
 
@@ -358,9 +385,11 @@ Account id [Enter = LINJJ, - = single-account mode]:
 | `WB_RESULT_FILE` | 否 | — | 写入 Markdown 汇总表，供 Actions 的 step summary 使用 |
 | `WB_ACCOUNT` | 否 | — | 账号 id，由 workflow 从矩阵注入，只用于日志与排错 |
 | `WB_ACCOUNT_LABEL` | 否 | — | 账号显示名，进飞书卡片标题与 step summary |
-| `WB_TOKEN_SECRET` | 否 | — | 该账号对应的 Secret 名，只用于「令牌为空」时的提示文案 |
+| `WB_ACCOUNT_HOST` | 否 | — | 该账号登录在哪台机器（`WB_ACCOUNTS` 里可选的 `host`），只进失败提示 |
+| `WB_TOKEN_SECRET` | 否 | — | 该账号对应的 Secret 名，进失败提示，让人能对上是哪一个 |
+| `WB_REPO` | 否 | — | 仓库名，失败提示里的同步命令用它；缺省显示 `OWNER/REPO` 占位 |
 
-后三项由 workflow 自动注入，手动本机运行 `wb_auto.py` 时不必设置。
+后五项由 workflow 自动注入，手动本机运行 `wb_auto.py` 时不必设置。它们**只影响提示文案**，不参与任何接口调用。
 
 ### 本机侧（`refresh_token.py`）
 
@@ -372,10 +401,12 @@ Account id [Enter = LINJJ, - = single-account mode]:
 | `--min-days N` | 仅在没有推送记录时生效：剩余不足 N 天就拒绝推送（默认 3）。有记录时按「谁更新用谁」比较 |
 | `--wait SEC` | 打开客户端后立刻运行时用：凭据刚被写过就最多等 SEC 秒，等到新令牌立即推送 |
 | `--check` | 只检查令牌新鲜度，不做任何写入 |
-| `--force` | 忽略新鲜度判断，强制推送 |
+| `--status` | **只读诊断**：把本机凭据、本机推送记录、远端 Secret 的最后更新时间摆在一起，告诉你是「已过期」「客户端已轮换该重推」「远端被脚本之外改过」还是「串号」。不解密、不写入，gh 读不到时自动降级成本地比对 |
+| `--expect-identity FP\|ask` | 防串号的兜底：`FP` 与本机身份指纹比对；`ask` 在有控制台时打印脱敏身份让你回车确认（静默模式不阻塞） |
+| `--force` | 忽略新鲜度与身份判断，强制推送 |
 | `--log PATH` | 输出追加到日志文件（静默运行用，日志中不含 token） |
 
-退出码：`0` 成功或无需推送 / `3` 令牌不新鲜已跳过 / `4` 令牌已过期 / `1` 其他错误。
+退出码：`0` 成功或无需推送 / `3` 令牌不新鲜已跳过 / `4` 令牌已过期 / `5` 疑似串号（本机登录的不是这个账号） / `1` 其他错误。
 
 ### 环境变量（`refresh_token.py`）
 
@@ -397,7 +428,7 @@ Account id [Enter = LINJJ, - = single-account mode]:
 | 猫猫在途中 | 汇报位置与预计到家时间，不派出 | `IN_TRIP` |
 | 猫猫空闲且名额未用完 | 派出一趟 | `DEPARTED` |
 | 今日名额已用完 | 读服务端 `daily_limit_reached`，不派出 | `LIMIT_REACHED` |
-| 认证被拒（401/403） | 提示重新运行 `refresh_token.py` | `AUTH` |
+| 认证被拒（401/403） | 卡片末尾多出「下一步」：账号、Secret 名、负责的机器、要跑的命令 | `AUTH` |
 | 网络不可达 | 有限重试后汇报，不误报成功 | `NETWORK` |
 | 猫猫模块异常 | 捕获后单独汇报，不影响签到 | `ERROR` |
 | 旅行状态取值未知 | 原样汇报，不做写操作 | `UNKNOWN_STATE` |
@@ -411,7 +442,7 @@ Account id [Enter = LINJJ, - = single-account mode]:
 | --- | --- |
 | `0` | 签到成功 |
 | `1` | 签到未达成（猫猫失败不在此列） |
-| `2` | 缺少令牌（该账号的 Secret 没有值，日志会指出具体是哪一个） |
+| `2` | 缺少令牌（该账号的 Secret 没有值）。日志会指出具体是哪一个；配了 webhook 时还会**照推一张飞书卡片**，写明 Secret 名与下一步命令（`WB_ACCOUNTS` 里配了 `host` 还会点名该在哪台机器操作） |
 
 workflow 中脚本以 `exit 0` 收尾，只对未完成项发 `::warning::`，因此一次运行显示绿色不代表签到一定成功——**以日志、step summary 与飞书卡片为准**。
 
@@ -444,6 +475,7 @@ wps/                          WPS 金山文档版（脚本 + 说明，见 wps/RE
 
 > `refresh_token.exe` 由 `refresh_token.py` 经 PyInstaller 打包（零第三方依赖），
 > 每次改动 `.py` 后需要重新构建。未做代码签名，SmartScreen 的提示属正常现象。
+> 当前仓库里的 exe 尚未包含 `--status` / `--expect-identity`（本次没有重新打包），要用新参数就走 `.py`。
 
 ## 安全设计
 
@@ -459,6 +491,8 @@ wps/                          WPS 金山文档版（脚本 + 说明，见 wps/RE
 
 - 一次性：本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；exe 同理）。
 - 一劳永逸：按「令牌自动续期」配好计划任务，之后无需再管。注意配好后 `refresh_token.py` 只在令牌剩余 ≥ 3 天时才写入 Secret，所以日志里出现「不新鲜/已过期，已跳过」是**正常保护行为**，不是故障——启动一次 WorkBuddy 就会恢复。
+
+**反复 401，但本机日志说「已跳过/已推送」** — 别猜，先跑 `python refresh_token.py --gh-repo OWNER/REPO --account 账号ID --status`。它只读，不动 Secret，会把「本机凭据是谁的、活不活」「本机记录里最后一次推的是什么」「远端那个 Secret 什么时候被改过」摆在一起，并直接给结论。多机器分工时反复 401 通常是两件事之一：这台机器登录的不是那个账号（串号，`--status` 会明说），或 Secret 在脚本之外被改过（`--status` 会提示「比本机记录新」）。详见「两台机器分工时，出问题先跑 `--status`」。
 
 **fork 之后 Actions 页签是空的** — fork 来的仓库默认不启用 Actions。进 Actions 页签，点页面中间的 **I understand my workflows, go ahead and enable them** 启用一次即可。
 
