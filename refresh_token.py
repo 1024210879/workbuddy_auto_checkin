@@ -1011,12 +1011,34 @@ def main():
         #   只有 argv 直传能让 run 恢复 200。
         # 代价：明文 token 短暂出现在本机进程列表——本脚本本就是单人单机的本机工具，
         # 威胁模型可接受；换来的是「推上去的值一定可用」这个更强的保证。
-        proc = subprocess.run(
-            ["gh", "secret", "set", secret, "--repo", opts["gh_repo"], "--body", token],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        if proc.returncode != 0:
-            raise SystemExit("写入 GitHub Secret 失败：" + proc.stderr.decode("utf-8", "replace"))
+        #
+        # 重试：登录后几分钟网络/代理常常还没就绪，恰恰是计划任务运行的时刻。
+        # 2026-10-22 实测：任务在开机 1 分钟后跑，gh 因网络瞬断失败且 stderr 为空，
+        # Secret 里留着已作废的旧令牌，Actions 必 401。这里重试 3 次、间隔 10 秒。
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                proc = subprocess.run(
+                    ["gh", "secret", "set", secret, "--repo", opts["gh_repo"], "--body", token],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError) as e:
+                proc = None
+                last_err = "%s: %s" % (type(e).__name__, e)
+            else:
+                last_err = proc.stderr.decode("utf-8", "replace").strip()
+                if proc.returncode == 0:
+                    break
+            if attempt < attempts:
+                print("[重试] 第 %d 次写入失败（%s），%d 秒后重试…"
+                      % (attempt, last_err or "原因不明", 10))
+                time.sleep(10)
+        else:
+            raise SystemExit(
+                "写入 GitHub Secret 失败（共尝试 %d 次）：\n  returncode=%s\n  stderr=%s"
+                % (attempts,
+                   proc.returncode if proc is not None else "N/A",
+                   last_err or "（空）"))
         write_state(secret, expires_at, fingerprint, idf)
         print("已写入 GitHub Secret %s（仓库 %s，令牌指纹 %s%s）"
               % (secret, opts["gh_repo"], fingerprint,

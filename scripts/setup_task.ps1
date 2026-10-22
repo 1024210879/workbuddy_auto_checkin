@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     注册「开机自动把本机 WorkBuddy 令牌同步到 GitHub Secret」的计划任务。
 
@@ -447,19 +447,38 @@ try {
         Write-Host "     触发  ：仅登录后 1 分钟"
     }
     Write-Host "     日志  ：$logFile"
-} catch {
-    # 常见于未提升权限的普通账户：计划任务服务拒绝写入
-    Write-Host "[!] 注册计划任务失败：$($_.Exception.Message)" -ForegroundColor Yellow
-    Write-Host "    改为写入「启动」文件夹（登录时运行，不需要管理员权限）`n"
-    if (-not (Install-StartupLauncher -Launcher $launcherName -Prefix ($prefix -join " ") `
-                -Repo $Repo -Account $Account -MinDays $MinDays -WaitSeconds $waitSecondsUsed `
-                -IntervalMinutes $IntervalMinutes -Suffix $suffix -CmdPath $cmdFile)) {
-        Write-Host "    如要使用计划任务，请以管理员身份打开 PowerShell 后重跑本脚本。" -ForegroundColor Red
-        exit 1
+    # 计划任务已接管登录同步；之前降级时留下的 vbs / 停止标记要清掉，
+    # 否则登录会双跑，更糟的是旧版 vbs 指向的 .cmd 可能已被删除（WSH 开机报错）
+    foreach ($staleVbs in @($startupVbs)) {
+        if (Test-Path -LiteralPath $staleVbs) {
+            Remove-Item -LiteralPath $staleVbs -Force
+            Write-Host "[--] 已清理降级启动项（计划任务已接管）：$staleVbs"
+        }
     }
-    Write-Host "     Secret：$secretName$(if ($Account) { "（账号 $Account）" })"
-    Write-Host "     日志  ：$logFile"
-    Write-Host "     说明  ：登录启动靠 .cmd 兜住，注销/重启后才会重新开始。" -ForegroundColor DarkGray}
+    if (Test-Path -LiteralPath $stopFlag) { Remove-Item -LiteralPath $stopFlag -Force }
+} catch {
+    # 常见于未提升权限的普通账户：计划任务服务拒绝写入。
+    # 但如果同名计划任务其实已经存在（以前注册成功过），它仍在接管登录同步，
+    # 此时再写降级 vbs 只会造成登录双跑——直接沿用现有任务即可。
+    $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        Write-Host "[!] 重新注册计划任务失败：$($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "    但同名计划任务已存在（状态 $($existingTask.State)），登录同步由它继续承担，" -ForegroundColor Yellow
+        Write-Host "    不写降级启动项。要更新任务参数请以管理员身份重跑本脚本。" -ForegroundColor Yellow
+    } else {
+        Write-Host "[!] 注册计划任务失败：$($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "    改为写入「启动」文件夹（登录时运行，不需要管理员权限）`n"
+        if (-not (Install-StartupLauncher -Launcher $launcherName -Prefix ($prefix -join " ") `
+                    -Repo $Repo -Account $Account -MinDays $MinDays -WaitSeconds $waitSecondsUsed `
+                    -IntervalMinutes $IntervalMinutes -Suffix $suffix -CmdPath $cmdFile)) {
+            Write-Host "    如要使用计划任务，请以管理员身份打开 PowerShell 后重跑本脚本。" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "     Secret：$secretName$(if ($Account) { "（账号 $Account）" })"
+        Write-Host "     日志  ：$logFile"
+        Write-Host "     说明  ：登录启动靠 .cmd 兜住，注销/重启后才会重新开始。" -ForegroundColor DarkGray
+    }
+}
 
 # ---------------------------------------------- 桌面快捷方式（手动同步用）
 # 场景：登录脚本只在开机时跑一次；你中途关掉再打开 WorkBuddy，客户端会轮换
@@ -482,6 +501,14 @@ if (-not $NoShortcut) {
     }
     if ($console) {
         $consolePrefix = if ($console -eq "py") { "-3 " } else { "" }
+        # run_refresh.cmd 是 git 跟踪的源码文件，且可能比本脚本内置模板更新
+        # （8e7497a 加过 RC 捕获与退出码提示，模板没有）。只在文件缺失时才用
+        # 模板生成（适配「不 via git、只拷代码」的场景）；已存在则绝不重写，
+        # 否则会把仓库里更新的版本降级回模板（2026-10-22 实测踩过）。
+        # :auto 段的追加 / 摘除由 Install-StartupLauncher 和 -Uninstall 负责。
+        if (Test-Path -LiteralPath $syncCmd) {
+            Write-Host "[--] run_refresh.cmd 已存在，保留仓库版本（不用内置模板覆盖）"
+        } else {
         $syncLines = @(
             '@echo off'
             'setlocal'
@@ -534,7 +561,9 @@ if (-not $NoShortcut) {
             'ping -n 9 127.0.0.1 >nul'
             'exit /b 0'
         )
+        # 这段只在文件缺失时执行（见上方注释）；模板里没有 :auto 段。
         [IO.File]::WriteAllText($syncCmd, (($syncLines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
+        }
 
         $desktop = [Environment]::GetFolderPath("Desktop")
         $lnkPath = Join-Path $desktop "同步 WorkBuddy 令牌.lnk"
@@ -560,6 +589,21 @@ if (-not $NoShortcut) {
         }
     } else {
         Write-Host "`n[!] 没找到控制台版 python（py/python），跳过桌面快捷方式" -ForegroundColor Yellow
+    }
+}
+
+# ---------------------------------------------- 启动项自检（防「改方案后残留」）
+# 本次开机报错 80070002 的根源就是：方案改成统一入口后，旧版 vbs 还指着
+# 已被删除的 per-account .cmd，没有任何机制去发现它坏了。这里兜底扫一遍：
+# 每个 WorkBuddyTokenRefresh*.vbs 的 sh.Run 目标都必须真实存在，否则删掉并明说。
+foreach ($vbs in (Get-ChildItem -LiteralPath $startupDir -Filter "WorkBuddyTokenRefresh*.vbs" -ErrorAction SilentlyContinue)) {
+    $text = [IO.File]::ReadAllText($vbs.FullName)
+    $m = [regex]::Match($text, 'sh\.Run\s+"""([^"]*)')
+    if (-not $m.Success) { continue }
+    $target = [regex]::Match($m.Groups[1].Value, '^[^"]+').Value
+    if ($target -and -not (Test-Path -LiteralPath $target)) {
+        Remove-Item -LiteralPath $vbs.FullName -Force
+        Write-Host "[--] 已清理失效启动项（目标不存在：$target）：$($vbs.Name)" -ForegroundColor Yellow
     }
 }
 
